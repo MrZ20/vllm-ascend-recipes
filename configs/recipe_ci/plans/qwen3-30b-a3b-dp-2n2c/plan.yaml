@@ -10,20 +10,14 @@ model:
 
 nodes:
   - id: node0
+    role: api
     launch: nodes/node0/run.sh
     readiness:
       port_start: 7100
-      count: 2
 
   - id: node1
+    role: headless
     launch: nodes/node1/run.sh
-    readiness:
-      port_start: 7100
-      count: 2
-
-gateway:
-  launch: gateway/run.sh
-  port: 38085
 
 checks:
   - id: completion

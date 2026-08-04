@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import subprocess
@@ -32,12 +33,13 @@ class PlanTests(unittest.TestCase):
         plan = load_plan(EXAMPLE / "plan.yaml")
 
         self.assertEqual(plan.name, "deepseek-v2-lite-pd-2n2c")
-        self.assertEqual(plan.leader.id, "prefill")
+        self.assertEqual(plan.leader.id, "node0")
+        self.assertEqual([node.role for node in plan.nodes], ["prefill", "decode"])
         self.assertEqual([node.index for node in plan.nodes], [0, 1])
         self.assertEqual([node.readiness.count for node in plan.nodes], [2, 2])
         self.assertEqual(
             [node.launch for node in plan.nodes],
-            ["nodes/prefill/run.sh", "nodes/decode/run.sh"],
+            ["nodes/node0/run.sh", "nodes/node1/run.sh"],
         )
         self.assertEqual(plan.gateway.port, 38085)
         self.assertEqual(len(plan.evaluations.accuracy), 1)
@@ -48,7 +50,7 @@ class PlanTests(unittest.TestCase):
             copied = Path(directory) / "example"
             shutil.copytree(EXAMPLE, copied)
             raw = yaml.safe_load((copied / "plan.yaml").read_text(encoding="utf-8"))
-            raw["nodes"][1]["launch"] = "nodes/prefill/run.sh"
+            raw["nodes"][1]["launch"] = "nodes/node0/run.sh"
             (copied / "plan.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
 
             with self.assertRaisesRegex(PlanError, "each node must have its own"):
@@ -56,26 +58,91 @@ class PlanTests(unittest.TestCase):
 
     def test_generic_dp_example_has_one_four_rank_group(self) -> None:
         plan = load_plan(GENERIC_DP_EXAMPLE / "plan.yaml")
-        node0_run = (GENERIC_DP_EXAMPLE / plan.nodes[0].launch).read_text(
+        api_run = (GENERIC_DP_EXAMPLE / plan.nodes[0].launch).read_text(
             encoding="utf-8"
         )
-        node1_run = (GENERIC_DP_EXAMPLE / plan.nodes[1].launch).read_text(
+        headless_run = (GENERIC_DP_EXAMPLE / plan.nodes[1].launch).read_text(
             encoding="utf-8"
         )
 
         self.assertEqual(plan.name, "qwen3-30b-a3b-dp-2n2c")
-        self.assertEqual([node.readiness.count for node in plan.nodes], [2, 2])
-        self.assertIn("--dp-size 4", node0_run)
-        self.assertIn("--dp-rank-start 0", node0_run)
-        self.assertIn("--dp-rank-start 2", node1_run)
-        self.assertIn('--dp-address "$RECIPE_NODE_0_IP"', node1_run)
+        self.assertEqual([node.id for node in plan.nodes], ["node0", "node1"])
+        self.assertEqual([node.role for node in plan.nodes], ["api", "headless"])
+        self.assertEqual(plan.nodes[0].readiness.count, 1)
+        self.assertIsNone(plan.nodes[1].readiness)
+        self.assertIsNone(plan.gateway)
+        self.assertIn("--data-parallel-size 4", api_run)
+        self.assertIn("--data-parallel-size-local 2", api_run)
+        self.assertIn("--headless", headless_run)
+        self.assertIn("--data-parallel-start-rank 2", headless_run)
+        self.assertIn(
+            '--data-parallel-address "$RECIPE_NODE_0_IP"', headless_run
+        )
+
+    def test_examples_keep_aisbench_model_config_in_the_plan(self) -> None:
+        for example in (EXAMPLE, GENERIC_DP_EXAMPLE):
+            accuracy_config = example / "aisbench/models/vllm_api_general_chat.py"
+            performance_config = example / "aisbench/models/vllm_api_stream_chat.py"
+            accuracy_script = (example / "evaluations/accuracy.sh").read_text(
+                encoding="utf-8"
+            )
+            performance_script = (example / "evaluations/performance.sh").read_text(
+                encoding="utf-8"
+            )
+
+            self.assertTrue(accuracy_config.is_file())
+            self.assertTrue(performance_config.is_file())
+            self.assertIn("$RECIPE_PLAN_DIR/aisbench", accuracy_script)
+            self.assertIn("vllm_api_general_chat", accuracy_script)
+            self.assertIn("$RECIPE_PLAN_DIR/aisbench", performance_script)
+            self.assertIn("vllm_api_stream_chat", performance_script)
 
     def test_hosts_must_match_plan_nodes(self) -> None:
         plan = load_plan(EXAMPLE / "plan.yaml")
         hosts = load_hosts(EXAMPLE / "hosts.example.yaml", plan)
 
-        self.assertEqual(set(hosts), {"prefill", "decode"})
-        self.assertEqual(hosts["prefill"].interface, "eth0")
+        self.assertEqual(set(hosts), {"node0", "node1"})
+        self.assertEqual(hosts["node0"].interface, "eth0")
+
+    def test_node_template_maps_launcher_index_to_selected_card(self) -> None:
+        template = EXAMPLE / "nodes/node0/run_dp_template.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            fake_bin = Path(directory)
+            fake_vllm = fake_bin / "vllm"
+            fake_vllm.write_text(
+                '#!/usr/bin/env bash\nprintf "%s\\n" "$ASCEND_RT_VISIBLE_DEVICES"\n',
+                encoding="utf-8",
+            )
+            fake_vllm.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                    "ASCEND_RT_VISIBLE_DEVICES": "4,5,6,7",
+                    "RECIPE_MODEL_PATH": "/models/fake",
+                    "RECIPE_SERVED_MODEL_NAME": "fake",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(template),
+                    "1",
+                    "7101",
+                    "2",
+                    "1",
+                    "127.0.0.1",
+                    "12321",
+                    "1",
+                ],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                check=True,
+            )
+
+        self.assertEqual(result.stdout.strip(), "5")
 
 
 class LocalRunnerTests(unittest.TestCase):
@@ -92,8 +159,8 @@ class LocalRunnerTests(unittest.TestCase):
             hosts_data = {
                 "version": 1,
                 "hosts": {
-                    "prefill": {"address": "127.0.0.1", "interface": "lo"},
-                    "decode": {"address": "127.0.0.1", "interface": "lo"},
+                    "node0": {"address": "127.0.0.1", "interface": "lo"},
+                    "node1": {"address": "127.0.0.1", "interface": "lo"},
                 },
             }
             hosts_path = plan_dir / "hosts.yaml"
@@ -123,13 +190,13 @@ class LocalRunnerTests(unittest.TestCase):
                 "accuracy",
             ]
             leader = subprocess.Popen(
-                [*command, "--node-id", "prefill"],
+                [*command, "--node-id", "node0"],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
             worker = subprocess.Popen(
-                [*command, "--node-id", "decode"],
+                [*command, "--node-id", "node1"],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -137,7 +204,7 @@ class LocalRunnerTests(unittest.TestCase):
             leader_output, _ = leader.communicate(timeout=30)
             worker_output, _ = worker.communicate(timeout=30)
             worker_log = (
-                artifact_root / "local-runner-test/decode/service.log"
+                artifact_root / "local-runner-test/node1/service.log"
             ).read_text(encoding="utf-8")
 
             self.assertEqual(
@@ -146,23 +213,21 @@ class LocalRunnerTests(unittest.TestCase):
                 f"{leader_output}\nworker output:\n{worker_output}\nworker log:\n{worker_log}",
             )
             self.assertEqual(worker.returncode, 0, worker_output)
-            self.assertIn("local backends ready", leader_output)
+            self.assertIn("local service ready", leader_output)
             self.assertIn("starting gateway", leader_output)
             self.assertIn("plan completed", leader_output)
             self.assertIn("plan completed", worker_output)
-            leader_artifacts = artifact_root / "local-runner-test" / "prefill"
+            leader_artifacts = artifact_root / "local-runner-test" / "node0"
             self.assertTrue((leader_artifacts / "checks/health.log").is_file())
             self.assertEqual(
                 (leader_artifacts / "accuracy/result.txt").read_text(encoding="utf-8"),
-                "accuracy-ran\n",
+                f"127.0.0.1:{gateway_port}\n",
             )
 
     @staticmethod
     def _write_fake_runtime(plan_dir: Path) -> None:
         required = (
             "examples/external_online_dp/launch_online_dp.py",
-            "examples/external_online_dp/dp_load_balance_proxy_server.py",
-            "examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py",
         )
         for relative_path in required:
             path = plan_dir / "vllm-ascend" / relative_path
@@ -177,8 +242,8 @@ class LocalRunnerTests(unittest.TestCase):
         gateway_port: int,
     ) -> None:
         for directory in (
-            "nodes/prefill",
-            "nodes/decode",
+            "nodes/node0",
+            "nodes/node1",
             "gateway",
             "checks",
             "evaluations",
@@ -205,8 +270,8 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
             'exec python3 "$RECIPE_PLAN_DIR/fake_service.py" '
             '"$RECIPE_LOCAL_IP" "$RECIPE_SERVICE_PORT_START"\n'
         )
-        (plan_dir / "nodes/prefill/run.sh").write_text(service_script, encoding="utf-8")
-        (plan_dir / "nodes/decode/run.sh").write_text(service_script, encoding="utf-8")
+        (plan_dir / "nodes/node0/run.sh").write_text(service_script, encoding="utf-8")
+        (plan_dir / "nodes/node1/run.sh").write_text(service_script, encoding="utf-8")
         (plan_dir / "gateway/run.sh").write_text(
             'exec python3 "$RECIPE_PLAN_DIR/fake_service.py" '
             '"$RECIPE_LOCAL_IP" "$RECIPE_GATEWAY_PORT"\n',
@@ -218,7 +283,8 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
             encoding="utf-8",
         )
         (plan_dir / "evaluations/accuracy.sh").write_text(
-            'echo accuracy-ran > "$RECIPE_ARTIFACT_DIR/result.txt"\n',
+            'echo "$RECIPE_ENDPOINT_HOST:$RECIPE_ENDPOINT_PORT" '
+            '> "$RECIPE_ARTIFACT_DIR/result.txt"\n',
             encoding="utf-8",
         )
 
@@ -229,13 +295,15 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
             "model": {"id": "fake/model", "served_name": "fake"},
             "nodes": [
                 {
-                    "id": "prefill",
-                    "launch": "nodes/prefill/run.sh",
+                    "id": "node0",
+                    "role": "prefill",
+                    "launch": "nodes/node0/run.sh",
                     "readiness": {"port_start": prefill_port},
                 },
                 {
-                    "id": "decode",
-                    "launch": "nodes/decode/run.sh",
+                    "id": "node1",
+                    "role": "decode",
+                    "launch": "nodes/node1/run.sh",
                     "readiness": {"port_start": decode_port},
                 },
             ],

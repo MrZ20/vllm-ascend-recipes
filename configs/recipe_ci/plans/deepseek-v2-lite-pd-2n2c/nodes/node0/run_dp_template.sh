@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export ASCEND_RT_VISIBLE_DEVICES="$1"
+# launch_online_dp.py passes logical device indexes. Map them onto the cards
+# selected before starting the Runner, for example 4,5.
+IFS=',' read -r -a selected_devices <<< \
+    "${RECIPE_CI_VISIBLE_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:-0,1}}"
+export ASCEND_RT_VISIBLE_DEVICES="${selected_devices[$1]}"
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True

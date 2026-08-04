@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-exec python3 \
-    "$RECIPE_VLLM_ASCEND_ROOT/examples/external_online_dp/launch_online_dp.py" \
-    --dp-size 4 \
-    --tp-size 1 \
-    --dp-size-local "$RECIPE_SERVICE_COUNT" \
-    --dp-rank-start 0 \
-    --dp-address "$RECIPE_NODE_0_IP" \
-    --dp-rpc-port 12321 \
-    --vllm-start-port "$RECIPE_SERVICE_PORT_START"
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_BUFFSIZE=1024
+export VLLM_USE_MODELSCOPE=true
+
+exec vllm serve "$RECIPE_MODEL_PATH" \
+    --host "$RECIPE_LOCAL_IP" \
+    --port "$RECIPE_SERVICE_PORT_START" \
+    --served-model-name "$RECIPE_SERVED_MODEL_NAME" \
+    --data-parallel-size 4 \
+    --data-parallel-size-local 2 \
+    --data-parallel-address "$RECIPE_NODE_0_IP" \
+    --data-parallel-rpc-port 12321 \
+    --tensor-parallel-size 1 \
+    --max-model-len 4096 \
+    --max-num-seqs 8 \
+    --max-num-batched-tokens 4096 \
+    --gpu-memory-utilization 0.9 \
+    --trust-remote-code \
+    --enable-expert-parallel \
+    --no-enable-prefix-caching \
+    --enforce-eager

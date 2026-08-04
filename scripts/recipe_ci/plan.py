@@ -31,8 +31,9 @@ class Readiness:
 class Node:
     id: str
     index: int
+    role: str
     launch: str
-    readiness: Readiness
+    readiness: Readiness | None
 
 
 @dataclass(frozen=True)
@@ -168,8 +169,28 @@ def load_plan(path: Path) -> Plan:
     for index, item in enumerate(nodes_raw):
         node_raw = _mapping(item, f"nodes[{index}]")
         node_id = _string(node_raw.get("id"), f"nodes[{index}].id")
+        role = _string(node_raw.get("role"), f"nodes[{index}].role")
         launch = _script(path, node_raw.get("launch"), f"nodes[{index}].launch")
-        readiness_raw = _mapping(node_raw.get("readiness"), f"nodes[{index}].readiness")
+        readiness_value = node_raw.get("readiness")
+        readiness: Readiness | None = None
+        if readiness_value is not None:
+            readiness_raw = _mapping(
+                readiness_value, f"nodes[{index}].readiness"
+            )
+            readiness = Readiness(
+                port_start=_positive_int(
+                    readiness_raw.get("port_start"),
+                    f"nodes[{index}].readiness.port_start",
+                ),
+                count=_positive_int(
+                    readiness_raw.get("count", 1),
+                    f"nodes[{index}].readiness.count",
+                ),
+                health_path=_string(
+                    readiness_raw.get("health_path", "/health"),
+                    f"nodes[{index}].readiness.health_path",
+                ),
+            )
         if node_id in node_ids:
             raise PlanError(f"duplicate node id: {node_id}")
         if launch in launch_scripts:
@@ -178,21 +199,9 @@ def load_plan(path: Path) -> Plan:
             Node(
                 id=node_id,
                 index=index,
+                role=role,
                 launch=launch,
-                readiness=Readiness(
-                    port_start=_positive_int(
-                        readiness_raw.get("port_start"),
-                        f"nodes[{index}].readiness.port_start",
-                    ),
-                    count=_positive_int(
-                        readiness_raw.get("count", 1),
-                        f"nodes[{index}].readiness.count",
-                    ),
-                    health_path=_string(
-                        readiness_raw.get("health_path", "/health"),
-                        f"nodes[{index}].readiness.health_path",
-                    ),
-                ),
+                readiness=readiness,
             )
         )
         node_ids.add(node_id)
@@ -210,6 +219,8 @@ def load_plan(path: Path) -> Plan:
                 "gateway.health_path",
             ),
         )
+    elif nodes[0].readiness is None:
+        raise PlanError("the leader needs HTTP readiness when gateway is omitted")
 
     evaluations_raw = _mapping(raw.get("evaluations", {}), "evaluations")
     return Plan(

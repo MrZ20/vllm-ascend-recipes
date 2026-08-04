@@ -6,8 +6,8 @@ exec python3 \
     --host "$RECIPE_LOCAL_IP" \
     --port "$RECIPE_GATEWAY_PORT" \
     --prefiller-hosts \
-    "$RECIPE_NODE_PREFILL_IP" "$RECIPE_NODE_PREFILL_IP" \
+    "$RECIPE_NODE_0_IP" "$RECIPE_NODE_0_IP" \
     --prefiller-ports 7100 7101 \
     --decoder-hosts \
-    "$RECIPE_NODE_DECODE_IP" "$RECIPE_NODE_DECODE_IP" \
+    "$RECIPE_NODE_1_IP" "$RECIPE_NODE_1_IP" \
     --decoder-ports 7100 7101

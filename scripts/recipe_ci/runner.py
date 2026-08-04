@@ -38,11 +38,6 @@ from scripts.recipe_ci.plan import (  # noqa: E402
 
 
 DEFAULT_VLLM_ASCEND_ROOT = Path("/vllm-workspace/vllm-ascend")
-REQUIRED_VLLM_ASCEND_TOOLS = (
-    Path("examples/external_online_dp/launch_online_dp.py"),
-    Path("examples/external_online_dp/dp_load_balance_proxy_server.py"),
-    Path("examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py"),
-)
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -128,11 +123,8 @@ def resolve_vllm_ascend_root(requested: Path | None) -> Path:
         os.environ.get("VLLM_ASCEND_ROOT", str(DEFAULT_VLLM_ASCEND_ROOT))
     )
     root = root.resolve()
-    for relative_path in REQUIRED_VLLM_ASCEND_TOOLS:
-        if not (root / relative_path).is_file():
-            raise RunnerError(
-                f"vllm-ascend runtime tool not found: {root / relative_path}"
-            )
+    if not root.is_dir():
+        raise RunnerError(f"vllm-ascend source directory not found: {root}")
     return root
 
 
@@ -156,8 +148,10 @@ def base_environment(
     environment.update(
         {
             "RECIPE_PLAN_DIR": str(plan.directory),
+            "RECIPE_REPOSITORY_ROOT": str(ROOT),
             "RECIPE_NODE_ID": node.id,
             "RECIPE_NODE_INDEX": str(node.index),
+            "RECIPE_NODE_ROLE": node.role,
             "RECIPE_LOCAL_IP": local_ip,
             "RECIPE_LOCAL_INTERFACE": interface,
             "RECIPE_LEADER_IP": leader_ip,
@@ -165,8 +159,6 @@ def base_environment(
             "RECIPE_MODEL_ID": plan.model.id,
             "RECIPE_MODEL_PATH": model_path,
             "RECIPE_SERVED_MODEL_NAME": plan.model.served_name,
-            "RECIPE_SERVICE_PORT_START": str(node.readiness.port_start),
-            "RECIPE_SERVICE_COUNT": str(node.readiness.count),
             "RECIPE_VLLM_ASCEND_ROOT": str(vllm_ascend_root),
             "RECIPE_ARTIFACT_ROOT": str(artifact_root),
             "HCCL_IF_IP": local_ip,
@@ -175,6 +167,9 @@ def base_environment(
             "TP_SOCKET_IFNAME": interface,
         }
     )
+    if node.readiness:
+        environment["RECIPE_SERVICE_PORT_START"] = str(node.readiness.port_start)
+        environment["RECIPE_SERVICE_COUNT"] = str(node.readiness.count)
     if plan.gateway:
         environment["RECIPE_GATEWAY_PORT"] = str(plan.gateway.port)
     for plan_node in plan.nodes:
@@ -263,6 +258,8 @@ def wait_node_ready(
     timeout: int,
     check_runtime: Callable[[], object],
 ) -> None:
+    if node.readiness is None:
+        return
     deadline = time.monotonic() + timeout
     for offset in range(node.readiness.count):
         remaining = max(1, int(deadline - time.monotonic()))
@@ -359,10 +356,13 @@ def run_node(
     if plan.gateway:
         endpoint_port = plan.gateway.port
     else:
+        if plan.leader.readiness is None:
+            raise RunnerError("leader endpoint has no HTTP readiness configuration")
         endpoint_port = plan.leader.readiness.port_start
-    environment["RECIPE_ENDPOINT"] = (
-        f"http://{hosts[plan.leader.id].address}:{endpoint_port}"
-    )
+    endpoint_host = hosts[plan.leader.id].address
+    environment["RECIPE_ENDPOINT_HOST"] = endpoint_host
+    environment["RECIPE_ENDPOINT_PORT"] = str(endpoint_port)
+    environment["RECIPE_ENDPOINT"] = f"http://{endpoint_host}:{endpoint_port}"
 
     coordinator: LeaderCoordinator | None = None
     client = CoordinatorClient(hosts[plan.leader.id].address, args.control_port)
@@ -393,7 +393,7 @@ def run_node(
 
         if coordinator:
             coordinator.state.mark_ready(node.id)
-            print(f"[{node.id}] local backends ready; waiting for the other nodes")
+            print(f"[{node.id}] local service ready; waiting for the other nodes")
             coordinator.wait_ready(
                 args.startup_timeout_seconds,
                 lambda: check_processes(processes),
@@ -442,7 +442,7 @@ def run_node(
             print(f"[{node.id}] plan completed")
         else:
             client.mark_ready(node.id, args.startup_timeout_seconds)
-            print(f"[{node.id}] local backends ready; waiting for the leader result")
+            print(f"[{node.id}] local service ready; waiting for the leader result")
             result = client.wait_terminal(
                 args.run_timeout_seconds,
                 lambda: check_processes(processes),

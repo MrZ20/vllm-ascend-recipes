@@ -15,7 +15,6 @@ completion 检查和可选的 AISBench 评测。
 ```text
 /vllm-workspace/vllm-ascend/
 ├── examples/external_online_dp/launch_online_dp.py
-├── examples/external_online_dp/dp_load_balance_proxy_server.py
 └── examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
 ```
 
@@ -45,7 +44,6 @@ SSH 凭据：
 
 ```bash
 test -f /vllm-workspace/vllm-ascend/examples/external_online_dp/launch_online_dp.py
-test -f /vllm-workspace/vllm-ascend/examples/external_online_dp/dp_load_balance_proxy_server.py
 test -f /vllm-workspace/vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
 
 cd /vllm-workspace
@@ -55,8 +53,8 @@ git clone --branch <your-branch> --depth 1 \
 cd /vllm-workspace/vllm-ascend-recipes
 ```
 
-两台机器都复制并填写同一份 hosts 文件。`prefill` 是控制面 leader；这里的默认值来自
-节点顺序，不需要在 plan 中重复声明：
+两台机器都复制并填写同一份 hosts 文件。`node0` 的角色是 Prefill，并作为默认控制面
+leader；这里的默认值来自节点顺序，不需要在 plan 中重复声明：
 
 ```bash
 cp configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/hosts.example.yaml \
@@ -72,28 +70,33 @@ scripts/recipe_ci/run.sh \
   --validate-only
 ```
 
-Prefill 机器执行：
+Prefill 机器作为 `node0` 执行：
 
 ```bash
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+
 scripts/recipe_ci/run.sh \
   --plan configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml \
   --hosts /tmp/deepseek-v2-lite-hosts.yaml \
-  --node-id prefill \
+  --node-id node0 \
   --model-path /models/DeepSeek-V2-Lite-W8A8
 ```
 
-Decode 机器执行：
+Decode 机器作为 `node1` 执行：
 
 ```bash
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+
 scripts/recipe_ci/run.sh \
   --plan configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml \
   --hosts /tmp/deepseek-v2-lite-hosts.yaml \
-  --node-id decode \
+  --node-id node1 \
   --model-path /models/DeepSeek-V2-Lite-W8A8
 ```
 
 两边的启动先后没有要求。框架默认使用
 `/vllm-workspace/vllm-ascend`；非标准镜像可通过 `--vllm-ascend-root` 覆盖。
+每节点只消费候选列表的前两张卡；卡号需按两台机器各自的 `npu-smi info` 结果选择。
 框架不会清理或改写任何 `http_proxy`、`https_proxy`、`ftp_proxy` 环境变量，只为集群
 IP 补充 `NO_PROXY`。
 
@@ -104,17 +107,17 @@ IP 补充 `NO_PROXY`。
 
 ```text
 /tmp/recipe-ci/deepseek-v2-lite-pd-2n2c/
-├── prefill/
+├── node0/
 │   ├── service.log
 │   ├── gateway.log
 │   └── checks/completion.log
-└── decode/service.log
+└── node1/service.log
 ```
 
 ## 可选 AISBench 阶段
 
-默认只运行 completion smoke check。确认 AISBench 已安装，并让选用的 AISBench 模型
-配置指向 `<prefill_ip>:38085`、模型名为 `deepseek-v2-lite` 后，可在 Prefill 命令增加：
+默认只运行 completion smoke check。确认 AISBench 及 GSM8K 数据集已按
+`docs/MULTI_NODE_RECIPE_CI.md` 安装后，可在 Prefill 命令增加：
 
 ```bash
 --evaluation accuracy
@@ -122,8 +125,13 @@ IP 补充 `NO_PROXY`。
 --evaluation all
 ```
 
-模型配置名可分别通过 `RECIPE_AISBENCH_ACCURACY_MODEL_CONFIG` 和
-`RECIPE_AISBENCH_PERFORMANCE_MODEL_CONFIG` 覆盖。评测命令输出和 AISBench 产物都会
+plan 内的 `aisbench/models/vllm_api_general_chat.py` 和 `vllm_api_stream_chat.py` 是
+Recipe 转换产物，分别供精度和性能评测使用。它们会读取当前 endpoint、模型路径和
+served model，无需修改 AISBench 安装目录。模型配置名可分别通过
+`RECIPE_AISBENCH_ACCURACY_MODEL_CONFIG` 和
+`RECIPE_AISBENCH_PERFORMANCE_MODEL_CONFIG` 覆盖；样本数可通过
+`RECIPE_AISBENCH_ACCURACY_NUM_PROMPTS` 和
+`RECIPE_AISBENCH_PERFORMANCE_NUM_PROMPTS` 调整。评测命令输出和 AISBench 产物都会
 写到该节点的 `accuracy/` 或 `performance/` artifact 目录。
 
 若评测可能超过默认的一小时运行超时，需要在 Decode 命令上增加足够大的

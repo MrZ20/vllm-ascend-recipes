@@ -9,14 +9,16 @@ model:
   served_name: deepseek-v2-lite
 
 nodes:
-  - id: prefill
-    launch: nodes/prefill/run.sh
+  - id: node0
+    role: prefill
+    launch: nodes/node0/run.sh
     readiness:
       port_start: 7100
       count: 2
 
-  - id: decode
-    launch: nodes/decode/run.sh
+  - id: node1
+    role: decode
+    launch: nodes/node1/run.sh
     readiness:
       port_start: 7100
       count: 2
