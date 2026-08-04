@@ -1,0 +1,9 @@
+version: 1
+
+hosts:
+  prefill:
+    address: 192.168.1.10
+    interface: eth0
+  decode:
+    address: 192.168.1.11
+    interface: eth0
