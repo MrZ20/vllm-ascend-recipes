@@ -1,9 +1,0 @@
-version: 1
-
-hosts:
-  node0:
-    address: 192.168.1.10
-    interface: eth0
-  node1:
-    address: 192.168.1.11
-    interface: eth0

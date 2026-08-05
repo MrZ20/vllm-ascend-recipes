@@ -4,18 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import os
-import re
-import signal
+import platform
 import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Callable
+from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -32,8 +31,29 @@ from scripts.recipe_ci.plan import (  # noqa: E402
     Plan,
     PlanError,
     ScriptStep,
+    format_topology_summary,
     load_hosts,
     load_plan,
+)
+from scripts.recipe_ci.process import (  # noqa: E402
+    CancellationRequested,
+    ManagedProcess,
+    ManagedProcessExited,
+    check_processes,
+    signal_cancellation_event,
+    start_process,
+    stop_processes,
+    tail_log,
+    wait_for_process,
+)
+from scripts.recipe_ci.result import (  # noqa: E402
+    RunFailure,
+    build_final_result,
+    build_node_result,
+    process_record,
+    read_json,
+    utc_now,
+    write_json_atomic,
 )
 
 
@@ -45,12 +65,12 @@ class RunnerError(RuntimeError):
     """The local node could not complete the plan."""
 
 
-@dataclass
-class ManagedProcess:
-    name: str
-    process: subprocess.Popen[bytes]
-    log_path: Path
-    log_file: BinaryIO
+class StageFailure(RuntimeError):
+    """Carry the single structured failure shape through the linear lifecycle."""
+
+    def __init__(self, failure: RunFailure) -> None:
+        self.failure = failure
+        super().__init__(failure.message)
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,14 +142,9 @@ def resolve_vllm_ascend_root(requested: Path | None) -> Path:
     root = requested or Path(
         os.environ.get("VLLM_ASCEND_ROOT", str(DEFAULT_VLLM_ASCEND_ROOT))
     )
-    root = root.resolve()
-    if not root.is_dir():
-        raise RunnerError(f"vllm-ascend source directory not found: {root}")
-    return root
-
-
-def _node_env_name(node_id: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "_", node_id).upper()
+    # The runner exposes this runtime contract but does not require every plan to
+    # consume the upstream source tree. A plan that uses it fails at its own script.
+    return root.expanduser().resolve()
 
 
 def base_environment(
@@ -140,7 +155,8 @@ def base_environment(
     model_path: str,
     vllm_ascend_root: Path,
     control_port: int,
-    artifact_root: Path,
+    plan_artifact_directory: Path,
+    node_artifact_directory: Path,
 ) -> dict[str, str]:
     local_ip = hosts[node.id].address
     leader_ip = hosts[plan.leader.id].address
@@ -160,7 +176,8 @@ def base_environment(
             "RECIPE_MODEL_PATH": model_path,
             "RECIPE_SERVED_MODEL_NAME": plan.model.served_name,
             "RECIPE_VLLM_ASCEND_ROOT": str(vllm_ascend_root),
-            "RECIPE_ARTIFACT_ROOT": str(artifact_root),
+            "RECIPE_ARTIFACT_ROOT": str(plan_artifact_directory),
+            "RECIPE_NODE_ARTIFACT_DIR": str(node_artifact_directory),
             "HCCL_IF_IP": local_ip,
             "HCCL_SOCKET_IFNAME": interface,
             "GLOO_SOCKET_IFNAME": interface,
@@ -173,71 +190,25 @@ def base_environment(
     if plan.gateway:
         environment["RECIPE_GATEWAY_PORT"] = str(plan.gateway.port)
     for plan_node in plan.nodes:
-        address = hosts[plan_node.id].address
-        environment[f"RECIPE_NODE_{plan_node.index}_IP"] = address
-        environment[f"RECIPE_NODE_{_node_env_name(plan_node.id)}_IP"] = address
+        environment[f"RECIPE_NODE_{plan_node.index}_IP"] = hosts[
+            plan_node.id
+        ].address
 
-    no_proxy = environment.get("NO_PROXY", environment.get("no_proxy", "")).split(",")
+    no_proxy = environment.get("NO_PROXY", environment.get("no_proxy", "")).split(
+        ","
+    )
     no_proxy.extend(host.address for host in hosts.values())
-    environment["NO_PROXY"] = ",".join(dict.fromkeys(item for item in no_proxy if item))
+    environment["NO_PROXY"] = ",".join(
+        dict.fromkeys(item for item in no_proxy if item)
+    )
     environment["no_proxy"] = environment["NO_PROXY"]
     return environment
-
-
-def launch_script(
-    name: str,
-    script: Path,
-    environment: dict[str, str],
-    log_path: Path,
-) -> ManagedProcess:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = log_path.open("wb")
-    print(f"[{environment['RECIPE_NODE_ID']}] starting {name}; log: {log_path}")
-    process = subprocess.Popen(
-        ["bash", script.name],
-        cwd=script.parent,
-        env=environment,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    return ManagedProcess(name, process, log_path, log_file)
-
-
-def check_processes(processes: list[ManagedProcess]) -> None:
-    for item in processes:
-        return_code = item.process.poll()
-        if return_code is not None:
-            raise RunnerError(
-                f"{item.name} exited with {return_code}; see {item.log_path}"
-            )
-
-
-def stop_processes(processes: list[ManagedProcess]) -> None:
-    for item in reversed(processes):
-        if item.process.poll() is None:
-            try:
-                os.killpg(item.process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-    deadline = time.monotonic() + 10
-    for item in reversed(processes):
-        if item.process.poll() is None:
-            try:
-                item.process.wait(max(0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(item.process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                item.process.wait()
-        item.log_file.close()
 
 
 def wait_http_ready(
     url: str,
     timeout: int,
-    check_runtime: Callable[[], object],
+    check_runtime: Callable[[], None],
 ) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -248,15 +219,15 @@ def wait_http_ready(
                     return
         except (OSError, urllib.error.URLError):
             pass
-        time.sleep(1)
-    raise RunnerError(f"timed out waiting for {url}")
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise TimeoutError(f"timed out waiting for {url}")
 
 
 def wait_node_ready(
     node: Node,
     host: Host,
     timeout: int,
-    check_runtime: Callable[[], object],
+    check_runtime: Callable[[], None],
 ) -> None:
     if node.readiness is None:
         return
@@ -276,58 +247,145 @@ def run_steps(
     plan: Plan,
     environment: dict[str, str],
     artifact_directory: Path,
-) -> None:
+    managed_processes: list[ManagedProcess],
+    check_runtime: Callable[[], None],
+    cancellation,
+) -> dict[str, object]:
+    results: dict[str, object] = {}
     for step in steps:
-        step_directory = artifact_directory / stage
+        stage_directory = artifact_directory / stage
+        step_directory = stage_directory / step.id
         step_directory.mkdir(parents=True, exist_ok=True)
+        result_path = step_directory / "result.json"
         step_environment = environment.copy()
-        step_environment["RECIPE_ARTIFACT_DIR"] = str(step_directory)
+        step_environment.update(
+            {
+                # v1 compatibility: existing plans use the stage directory.
+                "RECIPE_ARTIFACT_DIR": str(stage_directory),
+                "RECIPE_STEP_ARTIFACT_DIR": str(step_directory),
+                "RECIPE_STEP_RESULT_FILE": str(result_path),
+            }
+        )
         script = plan.directory / step.script
-        log_path = step_directory / f"{step.id}.log"
+        log_path = stage_directory / f"{step.id}.log"
         print(f"[leader] running {stage}: {step.id}; log: {log_path}")
-        with log_path.open("wb") as log_file:
-            try:
-                result = subprocess.run(
-                    ["bash", script.name],
-                    cwd=script.parent,
-                    env=step_environment,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    timeout=step.timeout_seconds,
-                    check=False,
+        item = start_process(
+            f"{stage} {step.id}",
+            ["bash", script.name],
+            cwd=script.parent,
+            environment=step_environment,
+            log_path=log_path,
+            stage=stage,
+            node_id=plan.leader.id,
+        )
+        managed_processes.append(item)
+        try:
+            return_code = wait_for_process(
+                item,
+                step.timeout_seconds,
+                check_runtime=check_runtime,
+                cancellation=cancellation,
+            )
+        except subprocess.TimeoutExpired as error:
+            category = "check_failed" if stage == "checks" else "evaluation_failed"
+            raise StageFailure(
+                RunFailure(
+                    category=category,
+                    stage=stage,
+                    node_id=plan.leader.id,
+                    step_id=step.id,
+                    message=f"{stage} {step.id} timed out after {step.timeout_seconds}s",
+                    log_path=log_path.relative_to(artifact_directory.parent).as_posix(),
                 )
-            except subprocess.TimeoutExpired as error:
-                raise RunnerError(
-                    f"{stage} {step.id} timed out; see {log_path}"
-                ) from error
-        if result.returncode != 0:
-            raise RunnerError(
-                f"{stage} {step.id} exited with {result.returncode}; see {log_path}"
+            ) from error
+        if return_code != 0:
+            category = "check_failed" if stage == "checks" else "evaluation_failed"
+            message = f"{stage} {step.id} exited with {return_code}"
+            log_tail = tail_log(log_path)
+            if log_tail:
+                message += f"\nlast log lines:\n{log_tail}"
+            raise StageFailure(
+                RunFailure(
+                    category=category,
+                    stage=stage,
+                    node_id=plan.leader.id,
+                    step_id=step.id,
+                    message=message,
+                    return_code=return_code,
+                    log_path=log_path.relative_to(artifact_directory.parent).as_posix(),
+                )
             )
 
+        result: dict[str, object] = {"status": "passed"}
+        if result_path.exists():
+            try:
+                result = read_json(result_path)
+            except (OSError, ValueError) as error:
+                raise StageFailure(
+                    RunFailure(
+                        category="evaluation_failed",
+                        stage=stage,
+                        node_id=plan.leader.id,
+                        step_id=step.id,
+                        message=f"invalid step result {result_path}: {error}",
+                        log_path=log_path.relative_to(
+                            artifact_directory.parent
+                        ).as_posix(),
+                    )
+                ) from error
+            if result.get("status") != "passed":
+                category = (
+                    "check_failed" if stage == "checks" else "evaluation_failed"
+                )
+                raise StageFailure(
+                    RunFailure(
+                        category=category,
+                        stage=stage,
+                        node_id=plan.leader.id,
+                        step_id=step.id,
+                        message=(
+                            f"{stage} {step.id} reported status "
+                            f"{result.get('status')!r}"
+                        ),
+                        log_path=log_path.relative_to(
+                            artifact_directory.parent
+                        ).as_posix(),
+                    )
+                )
+        elif stage != "checks":
+            raise StageFailure(
+                RunFailure(
+                    category="evaluation_failed",
+                    stage=stage,
+                    node_id=plan.leader.id,
+                    step_id=step.id,
+                    message=f"evaluation did not write {result_path}",
+                    log_path=log_path.relative_to(artifact_directory.parent).as_posix(),
+                )
+            )
+        results[step.id] = result
+    return results
 
-def run_evaluations(
-    selection: str,
-    plan: Plan,
-    environment: dict[str, str],
-    artifact_directory: Path,
-) -> None:
-    if selection in ("accuracy", "all"):
-        run_steps(
-            "accuracy",
-            plan.evaluations.accuracy,
-            plan,
-            environment,
-            artifact_directory,
-        )
-    if selection in ("performance", "all"):
-        run_steps(
-            "performance",
-            plan.evaluations.performance,
-            plan,
-            environment,
-            artifact_directory,
-        )
+
+def write_environment(path: Path, plan: Plan, node: Node) -> None:
+    packages: dict[str, str] = {}
+    for distribution in ("vllm", "vllm-ascend", "ais-bench-benchmark"):
+        try:
+            packages[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    value = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "architecture": platform.machine(),
+        "packages": packages,
+        "plan": plan.name,
+        "node_id": node.id,
+    }
+    for name in ("RECIPE_CI_IMAGE", "GITHUB_SHA"):
+        if os.environ.get(name):
+            value[name.lower()] = os.environ[name]
+    write_json_atomic(path, value)
 
 
 def run_node(
@@ -341,147 +399,402 @@ def run_node(
     model_path = (
         args.model_path or os.environ.get("RECIPE_CI_MODEL_PATH") or plan.model.id
     )
-    vllm_ascend_root = resolve_vllm_ascend_root(args.vllm_ascend_root)
-    artifact_directory = args.artifact_root / plan.name / node.id
+    plan_artifact_directory = (args.artifact_root / plan.name).resolve()
+    artifact_directory = plan_artifact_directory / node.id
+    artifact_directory.mkdir(parents=True, exist_ok=True)
+    started_at = utc_now()
     environment = base_environment(
         plan,
         node,
         hosts,
         interface,
         model_path,
-        vllm_ascend_root,
+        resolve_vllm_ascend_root(args.vllm_ascend_root),
         args.control_port,
-        args.artifact_root,
+        plan_artifact_directory,
+        artifact_directory,
     )
-    if plan.gateway:
-        endpoint_port = plan.gateway.port
-    else:
-        if plan.leader.readiness is None:
-            raise RunnerError("leader endpoint has no HTTP readiness configuration")
-        endpoint_port = plan.leader.readiness.port_start
+    endpoint_port = (
+        plan.gateway.port
+        if plan.gateway
+        else plan.leader.readiness.port_start  # validated by load_plan
+    )
     endpoint_host = hosts[plan.leader.id].address
-    environment["RECIPE_ENDPOINT_HOST"] = endpoint_host
-    environment["RECIPE_ENDPOINT_PORT"] = str(endpoint_port)
-    environment["RECIPE_ENDPOINT"] = f"http://{endpoint_host}:{endpoint_port}"
+    environment.update(
+        {
+            "RECIPE_ENDPOINT_HOST": endpoint_host,
+            "RECIPE_ENDPOINT_PORT": str(endpoint_port),
+            "RECIPE_ENDPOINT": f"http://{endpoint_host}:{endpoint_port}",
+        }
+    )
 
     coordinator: LeaderCoordinator | None = None
     client = CoordinatorClient(hosts[plan.leader.id].address, args.control_port)
-    processes: list[ManagedProcess] = []
+    managed_processes: list[ManagedProcess] = []
+    runtime_processes: list[ManagedProcess] = []
+    primary_failure: RunFailure | None = None
+    cleanup_failures: list[RunFailure] = []
+    warnings: list[str] = []
+    ready_at: str | None = None
+    terminal_at: str | None = None
+    terminal_status = "failed"
+    check_results: dict[str, object] = {}
+    evaluation_results: dict[str, object] = {}
 
-    try:
-        if node.id == plan.leader.id:
-            coordinator = LeaderCoordinator(
-                [item.id for item in plan.nodes], args.control_port
+    with signal_cancellation_event() as cancellation:
+        try:
+            if node.id == plan.leader.id:
+                coordinator = LeaderCoordinator(
+                    [item.id for item in plan.nodes],
+                    args.control_port,
+                    artifact_directory / "coordinator.log",
+                )
+                coordinator.start()
+
+            print(
+                f"[{node.id}] starting service launcher; "
+                f"log: {artifact_directory / 'service.log'}"
             )
-            coordinator.start()
-
-        service_script = plan.directory / node.launch
-        processes.append(
-            launch_script(
+            service_process = start_process(
                 "service launcher",
-                service_script,
-                environment,
-                artifact_directory / "service.log",
+                ["bash", (plan.directory / node.launch).name],
+                cwd=(plan.directory / node.launch).parent,
+                environment=environment,
+                log_path=artifact_directory / "service.log",
+                stage="service",
+                node_id=node.id,
             )
-        )
-        wait_node_ready(
-            node,
-            host,
-            args.startup_timeout_seconds,
-            lambda: check_processes(processes),
-        )
+            managed_processes.append(service_process)
+            runtime_processes.append(service_process)
 
-        if coordinator:
-            coordinator.state.mark_ready(node.id)
-            print(f"[{node.id}] local service ready; waiting for the other nodes")
-            coordinator.wait_ready(
-                args.startup_timeout_seconds,
-                lambda: check_processes(processes),
-            )
+            def check_local_runtime() -> None:
+                if cancellation.is_set():
+                    raise CancellationRequested("cancellation requested")
+                check_processes(runtime_processes)
 
-            if plan.gateway:
-                gateway_script = plan.directory / plan.gateway.launch
-                processes.append(
-                    launch_script(
-                        "gateway",
-                        gateway_script,
-                        environment,
-                        artifact_directory / "gateway.log",
+            try:
+                wait_node_ready(
+                    node, host, args.startup_timeout_seconds, check_local_runtime
+                )
+            except TimeoutError as error:
+                raise StageFailure(
+                    RunFailure(
+                        category="startup_timeout",
+                        stage="service",
+                        node_id=node.id,
+                        message=str(error),
+                        log_path=f"{node.id}/service.log",
                     )
+                ) from error
+            ready_at = utc_now()
+
+            if coordinator:
+                coordinator.state.mark_ready(node.id)
+                print(f"[{node.id}] local service ready; waiting for the other nodes")
+                coordinator.wait_ready(
+                    args.startup_timeout_seconds, check_local_runtime
                 )
 
-                def check_leader_runtime() -> None:
-                    check_processes(processes)
-                    coordinator.raise_if_failed()
+                if plan.gateway:
+                    gateway_script = plan.directory / plan.gateway.launch
+                    print(
+                        f"[{node.id}] starting gateway; "
+                        f"log: {artifact_directory / 'gateway.log'}"
+                    )
+                    gateway_process = start_process(
+                        "gateway",
+                        ["bash", gateway_script.name],
+                        cwd=gateway_script.parent,
+                        environment=environment,
+                        log_path=artifact_directory / "gateway.log",
+                        stage="gateway",
+                        node_id=node.id,
+                    )
+                    managed_processes.append(gateway_process)
+                    runtime_processes.append(gateway_process)
 
-                wait_http_ready(
-                    environment["RECIPE_ENDPOINT"] + plan.gateway.health_path,
-                    args.startup_timeout_seconds,
+                    def check_leader_runtime() -> None:
+                        check_local_runtime()
+                        coordinator.raise_if_failed()
+
+                    try:
+                        wait_http_ready(
+                            environment["RECIPE_ENDPOINT"]
+                            + plan.gateway.health_path,
+                            args.startup_timeout_seconds,
+                            check_leader_runtime,
+                        )
+                    except TimeoutError as error:
+                        raise StageFailure(
+                            RunFailure(
+                                category="gateway_failed",
+                                stage="gateway",
+                                node_id=node.id,
+                                message=str(error),
+                                log_path=f"{node.id}/gateway.log",
+                            )
+                        ) from error
+                else:
+
+                    def check_leader_runtime() -> None:
+                        check_local_runtime()
+                        coordinator.raise_if_failed()
+
+                check_results = run_steps(
+                    "checks",
+                    plan.checks,
+                    plan,
+                    environment,
+                    artifact_directory,
+                    managed_processes,
                     check_leader_runtime,
+                    cancellation,
+                )
+                if args.evaluation in ("accuracy", "all"):
+                    evaluation_results["accuracy"] = run_steps(
+                        "accuracy",
+                        plan.evaluations.accuracy,
+                        plan,
+                        environment,
+                        artifact_directory,
+                        managed_processes,
+                        check_leader_runtime,
+                        cancellation,
+                    )
+                if args.evaluation in ("performance", "all"):
+                    evaluation_results["performance"] = run_steps(
+                        "performance",
+                        plan.evaluations.performance,
+                        plan,
+                        environment,
+                        artifact_directory,
+                        managed_processes,
+                        check_leader_runtime,
+                        cancellation,
+                    )
+                check_leader_runtime()
+                coordinator.state.finish("passed")
+                terminal_status = "passed"
+                terminal_at = utc_now()
+            else:
+                client.mark_ready(node.id, args.startup_timeout_seconds)
+                print(f"[{node.id}] local service ready; waiting for the leader result")
+                state = client.wait_terminal(
+                    args.run_timeout_seconds, check_local_runtime
+                )
+                terminal_status = str(state["status"])
+                terminal_at = utc_now()
+                if terminal_status != "passed":
+                    category = (
+                        "cancelled" if terminal_status == "cancelled" else "node_failed"
+                    )
+                    raise StageFailure(
+                        RunFailure(
+                            category=category,
+                            stage="coordination",
+                            node_id=node.id,
+                            message=str(state.get("message") or terminal_status),
+                        )
+                    )
+        except StageFailure as error:
+            primary_failure = error.failure
+        except CancellationRequested as error:
+            terminal_status = "cancelled"
+            primary_failure = RunFailure(
+                category="cancelled",
+                stage="runner",
+                node_id=node.id,
+                message=str(error),
+            )
+        except ManagedProcessExited as error:
+            if error.item.stage == "gateway":
+                category = "gateway_failed"
+            elif ready_at is None:
+                category = "launch_failed"
+            else:
+                category = "node_failed"
+            primary_failure = RunFailure(
+                category=category,
+                stage=error.item.stage or "service",
+                node_id=node.id,
+                message=str(error),
+                return_code=error.return_code,
+                log_path=error.item.log_path.relative_to(
+                    plan_artifact_directory
+                ).as_posix(),
+            )
+        except CoordinatorError as error:
+            category = (
+                "coordinator_unreachable"
+                if error.code == "coordinator_unreachable"
+                else "node_failed"
+            )
+            primary_failure = RunFailure(
+                category=category,
+                stage="coordination",
+                node_id=node.id,
+                message=str(error),
+            )
+        except (OSError, RunnerError) as error:
+            primary_failure = RunFailure(
+                category="launch_failed",
+                stage="runner",
+                node_id=node.id,
+                message=str(error),
+            )
+        except Exception as error:
+            primary_failure = RunFailure(
+                category="internal_error",
+                stage="runner",
+                node_id=node.id,
+                message=f"{type(error).__name__}: {error}",
+            )
+
+        if primary_failure is not None:
+            terminal_status = (
+                "cancelled"
+                if primary_failure.category == "cancelled"
+                else "failed"
+            )
+            terminal_at = terminal_at or utc_now()
+            if coordinator:
+                try:
+                    coordinator.state.finish(terminal_status, primary_failure.message)
+                except CoordinatorError as error:
+                    warnings.append(f"could not publish terminal status: {error}")
+            else:
+                if primary_failure.category != "cancelled":
+                    try:
+                        client.mark_failed(node.id, primary_failure.message)
+                    except CoordinatorError as error:
+                        warnings.append(f"could not report node failure: {error}")
+
+        # Terminal is published before cleanup, but cleaned is not reported until
+        # process groups are stopped, logs are closed, and node-result.json exists.
+        for message in stop_processes(managed_processes):
+            cleanup_failures.append(
+                RunFailure(
+                    category="cleanup_failed",
+                    stage="cleanup",
+                    node_id=node.id,
+                    message=message,
+                )
+            )
+
+        process_results = [
+            process_record(
+                name=item.name,
+                pid=item.pid,
+                process_group=item.process_group,
+                started_at=item.started_at,
+                stage=item.stage,
+                return_code=item.process.poll(),
+                log_path=item.log_path.relative_to(plan_artifact_directory),
+            )
+            for item in managed_processes
+        ]
+        write_environment(artifact_directory / "environment.json", plan, node)
+        node_result = build_node_result(
+            node_id=node.id,
+            role=node.role,
+            status=terminal_status,
+            started_at=started_at,
+            processes=process_results,
+            ready_at=ready_at,
+            terminal_at=terminal_at,
+            primary_failure=primary_failure,
+            cleanup_errors=cleanup_failures,
+            warnings=warnings,
+            artifacts=[
+                path.relative_to(plan_artifact_directory)
+                for path in sorted(artifact_directory.rglob("*"))
+                if path.is_file() and path.name != "node-result.json"
+            ],
+        )
+        write_json_atomic(artifact_directory / "node-result.json", node_result)
+
+        if coordinator:
+            coordinator.state.mark_cleaned(node.id)
+            try:
+                coordinator.wait_cleaned(30)
+            except CoordinatorError as error:
+                cleanup_failure = RunFailure(
+                    category="cleanup_failed",
+                    stage="cleanup",
+                    node_id=node.id,
+                    message=str(error),
+                )
+                cleanup_failures.append(cleanup_failure)
+                if primary_failure is None:
+                    primary_failure = cleanup_failure
+                    terminal_status = "failed"
+            snapshot = coordinator.state.snapshot()
+            final_result = build_final_result(
+                plan=plan.name,
+                status=terminal_status,
+                started_at=started_at,
+                nodes={
+                    node_id: {
+                        "status": status,
+                        "failure": snapshot["failures"].get(node_id),
+                    }
+                    for node_id, status in snapshot["nodes"].items()
+                },
+                checks=check_results,
+                evaluations=evaluation_results,
+                primary_failure=primary_failure,
+                cleanup_errors=cleanup_failures,
+                warnings=warnings,
+            )
+            write_json_atomic(plan_artifact_directory / "result.json", final_result)
+            coordinator.close()
+        else:
+            try:
+                client.mark_cleaned(node.id)
+            except CoordinatorError as error:
+                cleanup_failure = RunFailure(
+                    category="cleanup_failed",
+                    stage="cleanup",
+                    node_id=node.id,
+                    message=f"could not report cleaned: {error}",
+                )
+                cleanup_failures.append(cleanup_failure)
+                if primary_failure is None:
+                    primary_failure = cleanup_failure
+                    terminal_status = "failed"
+                node_result = build_node_result(
+                    node_id=node.id,
+                    role=node.role,
+                    status=terminal_status,
+                    started_at=started_at,
+                    processes=process_results,
+                    ready_at=ready_at,
+                    terminal_at=terminal_at,
+                    primary_failure=primary_failure,
+                    cleanup_errors=cleanup_failures,
+                    warnings=warnings,
+                    artifacts=node_result["artifacts"],
+                )
+                write_json_atomic(
+                    artifact_directory / "node-result.json", node_result
                 )
 
-            run_steps(
-                "checks",
-                plan.checks,
-                plan,
-                environment,
-                artifact_directory,
-            )
-            run_evaluations(
-                args.evaluation,
-                plan,
-                environment,
-                artifact_directory,
-            )
-            check_processes(processes)
-            coordinator.raise_if_failed()
-            coordinator.state.finish("done")
-            coordinator.state.mark_completed(node.id)
-            coordinator.wait_completed(30)
-            coordinator.raise_if_failed()
-            print(f"[{node.id}] plan completed")
-        else:
-            client.mark_ready(node.id, args.startup_timeout_seconds)
-            print(f"[{node.id}] local service ready; waiting for the leader result")
-            result = client.wait_terminal(
-                args.run_timeout_seconds,
-                lambda: check_processes(processes),
-            )
-            client.mark_completed(node.id)
-            if result["status"] != "done":
-                raise RunnerError(str(result["message"]))
-            print(f"[{node.id}] plan completed")
-    except Exception as error:
-        if coordinator:
-            coordinator.state.finish("failed", str(error))
-            coordinator.state.mark_completed(node.id)
-            try:
-                coordinator.wait_completed(10)
-            except CoordinatorError:
-                pass
-        else:
-            try:
-                client.mark_failed(node.id, str(error))
-                client.mark_completed(node.id)
-            except CoordinatorError:
-                pass
-        raise
-    finally:
-        stop_processes(processes)
-        if coordinator:
-            coordinator.close()
+    if primary_failure is not None or cleanup_failures:
+        failure = primary_failure or cleanup_failures[0]
+        raise RunnerError(f"{failure.category}: {failure.message}")
+    print(f"[{node.id}] plan completed")
 
 
 def main() -> int:
     args = parse_args()
     try:
         plan = load_plan(args.plan)
+        hosts = load_hosts(args.hosts, plan) if args.hosts else None
         if args.validate_only:
-            print(f"valid plan: {plan.name} ({len(plan.nodes)} nodes)")
+            print(format_topology_summary(plan, hosts))
             return 0
-        if not args.hosts:
+        if hosts is None:
             raise RunnerError("--hosts is required unless --validate-only is used")
-        hosts = load_hosts(args.hosts, plan)
         node = select_node(plan, hosts, args.node_id)
         run_node(plan, hosts, node, args)
         return 0

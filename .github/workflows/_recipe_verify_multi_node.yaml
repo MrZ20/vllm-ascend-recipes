@@ -1,0 +1,292 @@
+name: Reusable multi-node Recipe CI
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: Intermediate plan executed by the LWS pods
+        required: true
+        type: string
+      image:
+        description: vLLM Ascend A3 image used by every LWS pod
+        required: false
+        type: string
+        default: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-ci-main-a3
+      evaluation:
+        description: Optional AISBench stage run by the plan leader
+        required: false
+        type: string
+        default: none
+      ref:
+        description: Recipes branch, tag, or commit; empty uses the caller commit
+        required: false
+        type: string
+        default: ""
+      startup_timeout_seconds:
+        description: Service and all-ready timeout
+        required: false
+        type: number
+        default: 3600
+      run_timeout_seconds:
+        description: Coordinated run timeout
+        required: false
+        type: number
+        default: 14400
+    secrets:
+      KUBECONFIG_B64:
+        required: true
+      RECIPE_CI_MODEL_PATH:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recipe-ci-${{ vars.RECIPE_CI_A3_RESOURCE_GROUP || 'a3-k8s-multi-node' }}
+  cancel-in-progress: false
+
+jobs:
+  recipe-ci:
+    name: ${{ inputs.plan }}
+    runs-on: ${{ vars.RECIPE_CI_K8S_CONTROLLER_RUNNER || 'linux-aarch64-a3-0' }}
+    # Leave time for Pod scheduling, cleanup, and artifact upload around the
+    # default one-hour startup plus four-hour coordinated run timeout.
+    timeout-minutes: 360
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu
+      env:
+        KUBECONFIG: /tmp/kubeconfig
+        NAMESPACE: vllm-project
+    steps:
+      - name: Decode kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          test -n "$KUBECONFIG_B64"
+          printf '%s' "$KUBECONFIG_B64" | base64 -d > "$KUBECONFIG"
+
+      - name: Checkout recipes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Prepare run identity and stage source
+        id: prepare
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          node_count=$(PLAN_PATH="$PLAN" PYTHONPATH=scripts/recipe_ci python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          from plan import load_plan
+
+          print(len(load_plan(Path(os.environ["PLAN_PATH"])).nodes))
+          PY
+          )
+          plan_name=$(basename "$(dirname "$PLAN")")
+          suffix=$(printf '%s' "$plan_name" | tr '[:upper:]_' '[:lower:]-' | cut -c1-32)
+          random_suffix=$(tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-6)
+          lws_name="recipe-${suffix}-${GITHUB_RUN_ID}-${random_suffix}"
+          lws_name=${lws_name:0:63}
+          run_root="/root/.cache/recipe-ci/$lws_name"
+
+          case "$run_root" in
+            /root/.cache/recipe-ci/recipe-*) ;;
+            *) echo "Unsafe run root: $run_root" >&2; exit 1 ;;
+          esac
+          rm -rf -- "$run_root"
+          mkdir -p "$run_root/source"
+          cp -a "$GITHUB_WORKSPACE"/. "$run_root/source/"
+
+          : > /tmp/recipe-ci-pods.txt
+          for ((index = 0; index < node_count; index++)); do
+            if [[ $index -eq 0 ]]; then
+              pod="${lws_name}-0"
+            else
+              pod="${lws_name}-0-${index}"
+            fi
+            echo "$pod" >> /tmp/recipe-ci-pods.txt
+          done
+
+          {
+            echo "LWS_NAME=$lws_name"
+            echo "PLAN_NAME=$plan_name"
+            echo "RECIPE_CI_NODE_COUNT=$node_count"
+            echo "RECIPE_CI_RUN_ROOT=$run_root"
+            echo "RECIPE_CI_COMMIT=$(git rev-parse HEAD)"
+          } >> "$GITHUB_ENV"
+          echo "artifact_name=recipe-ci-${plan_name}-${GITHUB_RUN_ID}-${random_suffix}" >> "$GITHUB_OUTPUT"
+
+      - name: Render and launch LeaderWorkerSet
+        env:
+          IMAGE: ${{ inputs.image }}
+          PLAN: ${{ inputs.plan }}
+          EVALUATION: ${{ inputs.evaluation }}
+          MODEL_PATH: ${{ secrets.RECIPE_CI_MODEL_PATH }}
+          STARTUP_TIMEOUT: ${{ inputs.startup_timeout_seconds }}
+          RUN_TIMEOUT: ${{ inputs.run_timeout_seconds }}
+          PVC_NAME: ${{ vars.RECIPE_CI_A3_PVC_NAME || 'gy005-az5-vllm-ascend' }}
+          AISBENCH_DATASET_DIR: ${{ vars.RECIPE_CI_AISBENCH_DATASET_DIR || '/vllm-workspace/vllm-ascend/benchmark/ais_bench/datasets/gsm8k' }}
+        run: |
+          set -euo pipefail
+          test -n "$MODEL_PATH"
+          jinja2 scripts/recipe_ci/k8s/lws.yaml.jinja2 \
+            -D lws_name="$LWS_NAME" \
+            -D namespace="$NAMESPACE" \
+            -D image="$IMAGE" \
+            -D commit="$RECIPE_CI_COMMIT" \
+            -D run_root="$RECIPE_CI_RUN_ROOT" \
+            -D plan="$PLAN" \
+            -D model_path="$MODEL_PATH" \
+            -D evaluation="$EVALUATION" \
+            -D node_count="$RECIPE_CI_NODE_COUNT" \
+            -D startup_timeout_seconds="$STARTUP_TIMEOUT" \
+            -D run_timeout_seconds="$RUN_TIMEOUT" \
+            -D pvc_name="$PVC_NAME" \
+            -D aisbench_dataset_dir="$AISBENCH_DATASET_DIR" \
+            --outfile "$RECIPE_CI_RUN_ROOT/lws.yaml"
+          kubectl apply -f "$RECIPE_CI_RUN_ROOT/lws.yaml"
+
+      - name: Wait for LWS pods to start
+        run: |
+          set -euo pipefail
+          mapfile -t pods < /tmp/recipe-ci-pods.txt
+          deadline=$((SECONDS + 1200))
+          while ((SECONDS < deadline)); do
+            all_started=true
+            for pod in "${pods[@]}"; do
+              phase=$(kubectl get pod "$pod" -n "$NAMESPACE" \
+                -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              echo "$pod phase=${phase:-NotFound}"
+              case "$phase" in
+                Running | Succeeded | Failed) ;;
+                *) all_started=false ;;
+              esac
+            done
+            if [[ "$all_started" == true ]]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          kubectl get pods -n "$NAMESPACE"
+          for pod in "${pods[@]}"; do
+            kubectl describe pod "$pod" -n "$NAMESPACE" || true
+          done
+          exit 1
+
+      - name: Stream logs and wait for Recipe CI
+        run: |
+          set -euo pipefail
+          mapfile -t pods < /tmp/recipe-ci-pods.txt
+          pids=()
+          # shellcheck disable=SC2329  # Invoked by the EXIT trap.
+          stop_streams() {
+            for pid in "${pids[@]}"; do
+              kill "$pid" 2>/dev/null || true
+            done
+          }
+          trap stop_streams EXIT
+
+          for index in "${!pods[@]}"; do
+            pod=${pods[$index]}
+            kubectl logs -f "$pod" -n "$NAMESPACE" 2>&1 \
+              | sed -u "s/^/[node${index}] /" \
+              | tee "/tmp/recipe-ci-node${index}.log" &
+            pids+=("$!")
+          done
+
+          deadline=$((SECONDS + ${{ inputs.startup_timeout_seconds }} + ${{ inputs.run_timeout_seconds }}))
+          while ((SECONDS < deadline)); do
+            all_terminal=true
+            for pod in "${pods[@]}"; do
+              phase=$(kubectl get pod "$pod" -n "$NAMESPACE" \
+                -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              if [[ ! "$phase" =~ ^(Succeeded|Failed)$ ]]; then
+                all_terminal=false
+              fi
+            done
+            [[ "$all_terminal" == true ]] && break
+            sleep 5
+          done
+
+          failed=0
+          for index in "${!pods[@]}"; do
+            pod=${pods[$index]}
+            exit_code=$(kubectl get pod "$pod" -n "$NAMESPACE" \
+              -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null || true)
+            echo "Recipe CI pod exit code: node${index}=${exit_code:-not-terminated}"
+            [[ "$exit_code" == 0 ]] || failed=1
+          done
+          exit "$failed"
+
+      - name: Delete LeaderWorkerSet
+        if: always()
+        run: |
+          if [[ -f "$RECIPE_CI_RUN_ROOT/lws.yaml" ]]; then
+            kubectl delete -f "$RECIPE_CI_RUN_ROOT/lws.yaml" --ignore-not-found=true || true
+          fi
+          deadline=$((SECONDS + 300))
+          while ((SECONDS < deadline)); do
+            pods=$(kubectl get pods -n "$NAMESPACE" \
+              -o jsonpath='{.items[*].metadata.name}' 2>/dev/null \
+              | tr ' ' '\n' | grep "^${LWS_NAME}-" || true)
+            [[ -z "$pods" ]] && break
+            sleep 5
+          done
+
+      - name: Build artifact bundle
+        if: always()
+        env:
+          IMAGE: ${{ inputs.image }}
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          bundle=/tmp/recipe-ci-bundle
+          mkdir -p "$bundle/pod-logs"
+          if [[ -d "$RECIPE_CI_RUN_ROOT/artifacts" ]]; then
+            cp -a "$RECIPE_CI_RUN_ROOT/artifacts" "$bundle/"
+          fi
+          if [[ -d "$RECIPE_CI_RUN_ROOT/plogs" ]]; then
+            cp -a "$RECIPE_CI_RUN_ROOT/plogs" "$bundle/"
+          fi
+          for ((index = 0; index < RECIPE_CI_NODE_COUNT; index++)); do
+            cp "/tmp/recipe-ci-node${index}.log" \
+              "$bundle/pod-logs/node${index}.log" 2>/dev/null || true
+          done
+          RECIPE_CI_BUNDLE="$bundle" RECIPE_CI_IMAGE="$IMAGE" RECIPE_CI_PLAN="$PLAN" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          bundle = Path(os.environ["RECIPE_CI_BUNDLE"])
+          metadata = {
+              "commit": os.environ["RECIPE_CI_COMMIT"],
+              "image": os.environ["RECIPE_CI_IMAGE"],
+              "plan": os.environ["RECIPE_CI_PLAN"],
+              "node_count": int(os.environ["RECIPE_CI_NODE_COUNT"]),
+              "lws_name": os.environ["LWS_NAME"],
+          }
+          (bundle / "ci-metadata.json").write_text(
+              json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload Recipe CI bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare.outputs.artifact_name }}
+          path: /tmp/recipe-ci-bundle/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Remove staged PVC data
+        if: always()
+        run: |
+          case "$RECIPE_CI_RUN_ROOT" in
+            /root/.cache/recipe-ci/recipe-*) rm -rf -- "$RECIPE_CI_RUN_ROOT" ;;
+            *) echo "Refusing to remove unsafe path: $RECIPE_CI_RUN_ROOT" >&2; exit 1 ;;
+          esac

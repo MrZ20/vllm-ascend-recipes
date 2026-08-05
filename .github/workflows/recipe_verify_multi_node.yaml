@@ -1,0 +1,47 @@
+name: Multi-node Recipe CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: Intermediate plan executed by the LWS pods
+        type: string
+        default: configs/recipe_ci/plans/deepseek-v4-flash-a3-pd/plan.yaml
+      image:
+        description: vLLM Ascend A3 image used by every LWS pod
+        type: string
+        default: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-ci-main-a3
+      evaluation:
+        description: Optional AISBench stage run by the plan leader
+        type: choice
+        options: [none, accuracy, performance, all]
+        default: none
+      ref:
+        description: Recipes branch, tag, or commit; empty uses this workflow commit
+        type: string
+        default: ""
+      startup_timeout_seconds:
+        description: Service and all-ready timeout
+        type: number
+        default: 3600
+      run_timeout_seconds:
+        description: Coordinated run timeout
+        type: number
+        default: 14400
+
+permissions:
+  contents: read
+
+jobs:
+  recipe-ci:
+    uses: ./.github/workflows/_recipe_verify_multi_node.yaml
+    with:
+      plan: ${{ inputs.plan }}
+      image: ${{ inputs.image }}
+      evaluation: ${{ inputs.evaluation }}
+      ref: ${{ inputs.ref }}
+      startup_timeout_seconds: ${{ inputs.startup_timeout_seconds }}
+      run_timeout_seconds: ${{ inputs.run_timeout_seconds }}
+    secrets:
+      KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+      RECIPE_CI_MODEL_PATH: ${{ secrets.RECIPE_CI_MODEL_PATH }}

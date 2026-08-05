@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from scripts.recipe_ci.plan import PlanError, load_hosts, load_plan  # noqa: E40
 
 EXAMPLE = ROOT / "configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c"
 GENERIC_DP_EXAMPLE = ROOT / "configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c"
+DEEPSEEK_V4_EXAMPLE = ROOT / "configs/recipe_ci/plans/deepseek-v4-flash-a3-pd"
 
 
 def free_port() -> int:
@@ -99,10 +102,25 @@ class PlanTests(unittest.TestCase):
 
     def test_hosts_must_match_plan_nodes(self) -> None:
         plan = load_plan(EXAMPLE / "plan.yaml")
-        hosts = load_hosts(EXAMPLE / "hosts.example.yaml", plan)
+        with tempfile.TemporaryDirectory() as directory:
+            hosts_path = Path(directory) / "hosts.yaml"
+            hosts_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "version": 1,
+                        "hosts": {
+                            "node0": {"address": "127.0.0.1", "interface": "lo"},
+                            "node1": {"address": "127.0.0.2"},
+                        },
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            hosts = load_hosts(hosts_path, plan)
 
         self.assertEqual(set(hosts), {"node0", "node1"})
-        self.assertEqual(hosts["node0"].interface, "eth0")
+        self.assertEqual(hosts["node0"].interface, "lo")
 
     def test_node_template_maps_launcher_index_to_selected_card(self) -> None:
         template = EXAMPLE / "nodes/node0/run_dp_template.sh"
@@ -144,6 +162,38 @@ class PlanTests(unittest.TestCase):
 
         self.assertEqual(result.stdout.strip(), "5")
 
+    def test_deepseek_v4_plan_matches_the_two_node_a3_recipe_topology(self) -> None:
+        plan = load_plan(DEEPSEEK_V4_EXAMPLE / "plan.yaml")
+        prefill_run = (DEEPSEEK_V4_EXAMPLE / plan.nodes[0].launch).read_text(
+            encoding="utf-8"
+        )
+        decode_run = (DEEPSEEK_V4_EXAMPLE / plan.nodes[1].launch).read_text(
+            encoding="utf-8"
+        )
+        prefill_template = (
+            DEEPSEEK_V4_EXAMPLE / "nodes/node0/run_dp_template.sh"
+        ).read_text(encoding="utf-8")
+        decode_template = (
+            DEEPSEEK_V4_EXAMPLE / "nodes/node1/run_dp_template.sh"
+        ).read_text(encoding="utf-8")
+        gateway = (DEEPSEEK_V4_EXAMPLE / "gateway/run.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual([node.id for node in plan.nodes], ["node0", "node1"])
+        self.assertEqual([node.role for node in plan.nodes], ["prefill", "decode"])
+        self.assertEqual([node.readiness.count for node in plan.nodes], [4, 16])
+        for argument in ("--dp-size 4", "--tp-size 4", "--dp-size-local 4"):
+            self.assertIn(argument, prefill_run)
+        for argument in ("--dp-size 16", "--tp-size 1", "--dp-size-local 16"):
+            self.assertIn(argument, decode_run)
+        self.assertIn('"kv_role": "kv_producer"', prefill_template)
+        self.assertIn('"kv_port": "30000"', prefill_template)
+        self.assertIn('"kv_role": "kv_consumer"', decode_template)
+        self.assertIn('"kv_port": "30100"', decode_template)
+        self.assertEqual(gateway.count('"$RECIPE_NODE_0_IP"'), 4)
+        self.assertEqual(gateway.count('"$RECIPE_NODE_1_IP"'), 16)
+
 
 class LocalRunnerTests(unittest.TestCase):
     def test_two_nodes_complete_gateway_check_and_accuracy_stage(self) -> None:
@@ -156,47 +206,35 @@ class LocalRunnerTests(unittest.TestCase):
             self._write_fake_runtime(plan_dir)
             self._write_fake_plan(plan_dir, prefill_port, decode_port, gateway_port)
 
-            hosts_data = {
-                "version": 1,
-                "hosts": {
-                    "node0": {"address": "127.0.0.1", "interface": "lo"},
-                    "node1": {"address": "127.0.0.1", "interface": "lo"},
-                },
-            }
-            hosts_path = plan_dir / "hosts.yaml"
-            hosts_path.write_text(
-                yaml.safe_dump(hosts_data, sort_keys=False), encoding="utf-8"
-            )
-
             artifact_root = plan_dir / "artifacts"
-            command = [
-                sys.executable,
-                str(ROOT / "scripts/recipe_ci/runner.py"),
-                "--plan",
-                str(plan_dir / "plan.yaml"),
-                "--hosts",
-                str(hosts_path),
-                "--vllm-ascend-root",
-                str(plan_dir / "vllm-ascend"),
-                "--control-port",
-                str(control_port),
-                "--startup-timeout-seconds",
-                "20",
-                "--run-timeout-seconds",
-                "20",
-                "--artifact-root",
-                str(artifact_root),
-                "--evaluation",
-                "accuracy",
-            ]
+            command = ["bash", str(ROOT / "scripts/recipe_ci/run.sh")]
+            common_environment = os.environ.copy()
+            common_environment.update(
+                {
+                    "RECIPE_CI_PLAN": str(plan_dir / "plan.yaml"),
+                    "RECIPE_CI_MODEL_PATH": "fake/model",
+                    "RECIPE_CI_CLUSTER_IPS": "127.0.0.1,127.0.0.1",
+                    "RECIPE_CI_INTERFACE": "lo",
+                    "VLLM_ASCEND_ROOT": str(plan_dir / "vllm-ascend"),
+                    "RECIPE_CI_CONTROL_PORT": str(control_port),
+                    "RECIPE_CI_STARTUP_TIMEOUT_SECONDS": "20",
+                    "RECIPE_CI_RUN_TIMEOUT_SECONDS": "20",
+                    "RECIPE_CI_ARTIFACT_ROOT": str(artifact_root),
+                    "RECIPE_CI_EVALUATION": "accuracy",
+                }
+            )
+            leader_environment = common_environment | {"LWS_WORKER_INDEX": "0"}
+            worker_environment = common_environment | {"LWS_WORKER_INDEX": "1"}
             leader = subprocess.Popen(
-                [*command, "--node-id", "node0"],
+                command,
+                env=leader_environment,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
             worker = subprocess.Popen(
-                [*command, "--node-id", "node1"],
+                command,
+                env=worker_environment,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -222,6 +260,117 @@ class LocalRunnerTests(unittest.TestCase):
             self.assertEqual(
                 (leader_artifacts / "accuracy/result.txt").read_text(encoding="utf-8"),
                 f"127.0.0.1:{gateway_port}\n",
+            )
+            final_result = json.loads(
+                (artifact_root / "local-runner-test/result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            leader_result = json.loads(
+                (leader_artifacts / "node-result.json").read_text(encoding="utf-8")
+            )
+            worker_result = json.loads(
+                (
+                    artifact_root
+                    / "local-runner-test/node1/node-result.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(final_result["status"], "passed")
+            self.assertEqual(
+                final_result["evaluations"]["accuracy"]["accuracy"]["metrics"][
+                    "accuracy"
+                ],
+                1.0,
+            )
+            self.assertEqual(leader_result["status"], "passed")
+            self.assertEqual(worker_result["status"], "passed")
+            self.assertIsNotNone(leader_result["cleaned_at"])
+            self.assertIsNotNone(worker_result["cleaned_at"])
+
+    def test_remote_service_failure_interrupts_a_supervised_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan_dir = Path(directory)
+            control_port = free_port()
+            prefill_port = free_port()
+            decode_port = free_port()
+            gateway_port = free_port()
+            self._write_fake_runtime(plan_dir)
+            self._write_fake_plan(plan_dir, prefill_port, decode_port, gateway_port)
+            (plan_dir / "checks/health.sh").write_text(
+                "sleep 20\n", encoding="utf-8"
+            )
+            (plan_dir / "nodes/node1/run.sh").write_text(
+                'python3 "$RECIPE_PLAN_DIR/fake_service.py" '
+                '"$RECIPE_LOCAL_IP" "$RECIPE_SERVICE_PORT_START" &\n'
+                "service_pid=$!\n"
+                "sleep 3\n"
+                'kill "$service_pid"\n'
+                'wait "$service_pid"\n',
+                encoding="utf-8",
+            )
+            hosts_path = plan_dir / "hosts.yaml"
+            hosts_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "version": 1,
+                        "hosts": {
+                            "node0": {"address": "127.0.0.1", "interface": "lo"},
+                            "node1": {"address": "127.0.0.1", "interface": "lo"},
+                        },
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            artifact_root = plan_dir / "artifacts"
+            command = [
+                sys.executable,
+                str(ROOT / "scripts/recipe_ci/runner.py"),
+                "--plan",
+                str(plan_dir / "plan.yaml"),
+                "--hosts",
+                str(hosts_path),
+                "--control-port",
+                str(control_port),
+                "--startup-timeout-seconds",
+                "15",
+                "--run-timeout-seconds",
+                "15",
+                "--artifact-root",
+                str(artifact_root),
+            ]
+            started = time.monotonic()
+            leader = subprocess.Popen(
+                [*command, "--node-id", "node0"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            worker = subprocess.Popen(
+                [*command, "--node-id", "node1"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            leader_output, _ = leader.communicate(timeout=25)
+            worker_output, _ = worker.communicate(timeout=25)
+
+            self.assertLess(time.monotonic() - started, 15)
+            self.assertNotEqual(leader.returncode, 0, leader_output)
+            self.assertNotEqual(worker.returncode, 0, worker_output)
+            final_result = json.loads(
+                (artifact_root / "local-runner-test/result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(final_result["status"], "failed")
+            self.assertEqual(final_result["failure"]["category"], "node_failed")
+            self.assertIn("node1", final_result["failure"]["message"])
+            self.assertTrue(
+                (artifact_root / "local-runner-test/node0/node-result.json").is_file()
+            )
+            self.assertTrue(
+                (artifact_root / "local-runner-test/node1/node-result.json").is_file()
             )
 
     @staticmethod
@@ -284,7 +433,9 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
         )
         (plan_dir / "evaluations/accuracy.sh").write_text(
             'echo "$RECIPE_ENDPOINT_HOST:$RECIPE_ENDPOINT_PORT" '
-            '> "$RECIPE_ARTIFACT_DIR/result.txt"\n',
+            '> "$RECIPE_ARTIFACT_DIR/result.txt"\n'
+            "printf '%s\\n' '{\"status\": \"passed\", \"type\": \"accuracy\", "
+            "\"metrics\": {\"accuracy\": 1.0}}' > \"$RECIPE_STEP_RESULT_FILE\"\n",
             encoding="utf-8",
         )
 

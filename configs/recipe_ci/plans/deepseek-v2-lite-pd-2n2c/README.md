@@ -53,49 +53,43 @@ git clone --branch <your-branch> --depth 1 \
 cd /vllm-workspace/vllm-ascend-recipes
 ```
 
-两台机器都复制并填写同一份 hosts 文件。`node0` 的角色是 Prefill，并作为默认控制面
-leader；这里的默认值来自节点顺序，不需要在 plan 中重复声明：
-
-```bash
-cp configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/hosts.example.yaml \
-  /tmp/deepseek-v2-lite-hosts.yaml
-vi /tmp/deepseek-v2-lite-hosts.yaml
-```
+两台机器通过相同的 `RECIPE_CI_CLUSTER_IPS` 提供按 `node0,node1` 排列的集群地址。
+`node0` 的角色是 Prefill，并作为默认控制面 leader；这里的默认值来自节点顺序，不需要
+在 plan 中重复声明。
 
 先检查中间态结构，不会检查 NPU 或启动服务：
 
 ```bash
-scripts/recipe_ci/run.sh \
-  --plan configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml \
-  --validate-only
+RECIPE_CI_PLAN=configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml \
+RECIPE_CI_VALIDATE_ONLY=true scripts/recipe_ci/run.sh
 ```
 
 Prefill 机器作为 `node0` 执行：
 
 ```bash
+export RECIPE_CI_PLAN=configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml
+export RECIPE_CI_MODEL_PATH=/models/DeepSeek-V2-Lite-W8A8
+export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
+export RECIPE_CI_INTERFACE="<local_interface>"
+export LWS_WORKER_INDEX=0
 export ASCEND_RT_VISIBLE_DEVICES=4,5
-
-scripts/recipe_ci/run.sh \
-  --plan configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml \
-  --hosts /tmp/deepseek-v2-lite-hosts.yaml \
-  --node-id node0 \
-  --model-path /models/DeepSeek-V2-Lite-W8A8
+scripts/recipe_ci/run.sh
 ```
 
 Decode 机器作为 `node1` 执行：
 
 ```bash
+export RECIPE_CI_PLAN=configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml
+export RECIPE_CI_MODEL_PATH=/models/DeepSeek-V2-Lite-W8A8
+export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
+export RECIPE_CI_INTERFACE="<local_interface>"
+export LWS_WORKER_INDEX=1
 export ASCEND_RT_VISIBLE_DEVICES=4,5
-
-scripts/recipe_ci/run.sh \
-  --plan configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml \
-  --hosts /tmp/deepseek-v2-lite-hosts.yaml \
-  --node-id node1 \
-  --model-path /models/DeepSeek-V2-Lite-W8A8
+scripts/recipe_ci/run.sh
 ```
 
 两边的启动先后没有要求。框架默认使用
-`/vllm-workspace/vllm-ascend`；非标准镜像可通过 `--vllm-ascend-root` 覆盖。
+`/vllm-workspace/vllm-ascend`；非标准镜像可通过 `VLLM_ASCEND_ROOT` 覆盖。
 每节点只消费候选列表的前两张卡；卡号需按两台机器各自的 `npu-smi info` 结果选择。
 框架不会清理或改写任何 `http_proxy`、`https_proxy`、`ftp_proxy` 环境变量，只为集群
 IP 补充 `NO_PROXY`。
@@ -117,12 +111,10 @@ IP 补充 `NO_PROXY`。
 ## 可选 AISBench 阶段
 
 默认只运行 completion smoke check。确认 AISBench 及 GSM8K 数据集已按
-`docs/MULTI_NODE_RECIPE_CI.md` 安装后，可在 Prefill 命令增加：
+`docs/MULTI_NODE_RECIPE_CI.md` 安装后，可在 Prefill 节点设置：
 
 ```bash
---evaluation accuracy
---evaluation performance
---evaluation all
+export RECIPE_CI_EVALUATION=accuracy  # 或 performance/all
 ```
 
 plan 内的 `aisbench/models/vllm_api_general_chat.py` 和 `vllm_api_stream_chat.py` 是
@@ -134,5 +126,5 @@ served model，无需修改 AISBench 安装目录。模型配置名可分别通�
 `RECIPE_AISBENCH_PERFORMANCE_NUM_PROMPTS` 调整。评测命令输出和 AISBench 产物都会
 写到该节点的 `accuracy/` 或 `performance/` artifact 目录。
 
-若评测可能超过默认的一小时运行超时，需要在 Decode 命令上增加足够大的
-`--run-timeout-seconds`；这个值只约束等待 leader 最终结果的节点，不写入 plan。
+若评测可能超过默认的一小时运行超时，需要在 Decode 节点设置足够大的
+`RECIPE_CI_RUN_TIMEOUT_SECONDS`；这个值只约束等待 leader 最终结果的节点，不写入 plan。

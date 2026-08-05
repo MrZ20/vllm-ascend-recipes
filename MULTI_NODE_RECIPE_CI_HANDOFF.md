@@ -1,497 +1,225 @@
 # Multi-node Recipe CI 开发交接
 
-更新日期：2026-08-04
+更新日期：2026-08-05
 
-当前分支：`add_mul_ci`
+分支：`add_mul_ci`
 
-当前基线提交：`c0dfce5`
+第二阶段开发基线：`c7d5fa448d680d80ae0a88da1a0ce79ae0e849ec`
 
-> 重要：本文所述修改目前仍在本机工作区，尚未提交或推送。换设备前必须执行
-> `git add -A`、提交并推送，或者生成并保存补丁；仅在新设备 clone `add_mul_ci`
-> 分支无法获得这些未提交修改。目录重命名在 `git status` 中会暂时表现为旧文件删除和
-> 新目录未跟踪，`git add -A` 后 Git 才会识别实际 rename。
+> 本文描述当前工作区状态。修改尚未提交时，换设备前必须提交并 push，或保存完整 patch；
+> 仅 clone 远端分支不会带走未提交内容。
 
-## 1. 本阶段目标和范围
+## 当前目标与边界
 
-本阶段从手工编写的 `configs/recipe_ci/plans/**/plan.yaml` 中间态开始，验证一个清晰、
-可维护的多节点执行框架。暂时不实现 Recipe 文档到中间态的转换，因为 Recipe 文档结构
-尚未最终确定。
+框架仍从手工 `configs/recipe_ci/plans/**/plan.yaml` 中间态开始，不实现 Recipe 文档转换。
+Runner 不理解 P/D、DP rank、KV Connector 或 gateway backend；每个节点执行自己的
+plan-local 脚本。控制面使用 HTTP，不依赖 Kubernetes 或共享文件系统。
 
-已经确定的边界：
-
-- 不依赖 Kubernetes；本地和 CI 都通过 `hosts.yaml` 显式提供节点 IP 和网卡。
-- 不依赖共享文件系统；当前控制面使用 HTTP 协调，后续可在不改变 plan 和节点脚本的
-  前提下替换协调实现。
-- 使用 vLLM Ascend 镜像作为运行环境。
-- recipes 仓库位于 `/vllm-workspace/vllm-ascend-recipes`，从该目录执行 Runner。
-- 镜像内 `/vllm-workspace/vllm-ascend` 提供与安装版本一致的上游源码和 example 工具。
-- 不把 `launch_online_dp.py`、P/D proxy 等上游脚本复制进 recipes 仓库。
-- Runner 不复刻 vLLM 的 rank/进程展开逻辑；每个节点只启动自己的独立 `run.sh`。
-- 不在通用流程中执行 `unset http_proxy`、`https_proxy`、`ftp_proxy`。Runner 只把集群
-  地址加入 `NO_PROXY`，内部 HTTP 客户端显式绕过代理。
-
-当前阶段只追求主链路清晰可执行，没有加入大量防御性逻辑。幂等安装、复杂 schema
-校验、重试策略等属于后续阶段。
-
-## 2. 当前目录和职责
+按本轮要求，第二阶段不增加或回归三、四节点用例。最终真实 CI 目标仅为：
 
 ```text
-scripts/recipe_ci/
-├── run.sh                  # 加载 Ascend 环境并进入 Python Runner
-├── runner.py               # 节点生命周期、环境注入、日志、清理
-├── coordinator.py          # 多节点 HTTP 协调协议
-├── plan.py                 # 中间态和 hosts 数据模型/解析
-└── install_aisbench.sh     # 对齐 nightly Dockerfile 的 AISBench 安装步骤
-
-configs/recipe_ci/plans/<case>/
-├── plan.yaml               # 手工中间态；未来由 Recipe 转换生成
-├── hosts.example.yaml      # 本地运行示例，不保存真实集群地址
-├── nodes/
-│   ├── node0/
-│   │   ├── run.sh
-│   │   └── run_dp_template.sh  # 仅使用上游 launcher 的节点需要
-│   └── node1/
-├── gateway/                # 可选统一入口，例如 P/D proxy
-├── checks/                 # curl/smoke 检查
-├── evaluations/            # accuracy/performance 执行脚本
-└── aisbench/
-    └── models/             # AISBench --config-dir 强制要求的 models 分类
-        ├── vllm_api_general_chat.py
-        └── vllm_api_stream_chat.py
+configs/recipe_ci/plans/deepseek-v4-flash-a3-pd
+node0: A3 Prefill DP4 x TP4，16 卡
+node1: A3 Decode  DP16 x TP1，16 卡
+gateway: node0:38085
 ```
 
-`aisbench/models` 两层不是重复目录：evaluation 脚本把
-`$RECIPE_PLAN_DIR/aisbench` 传给 `--config-dir`，AISBench 固定从该目录下的 `models/`
-查找模型请求配置。保留 `aisbench/` 也为后续的 `datasets/`、`summarizers/` 留出独立
-命名空间，避免污染 plan 根目录。
+现有 DeepSeek V2 两节点 P/D 和 Qwen 两节点普通内部 DP 只保留兼容，不作为本轮新增真实
+回归目标。
 
-## 3. 中间态约定
+## 已落实内容
 
-节点身份统一按执行实例编号，不使用角色作为主键：
+### Plan/schema
 
-```yaml
-nodes:
-  - id: node0
-    role: prefill
-    launch: nodes/node0/run.sh
-  - id: node1
-    role: decode
-    launch: nodes/node1/run.sh
-```
+- `recipe-ci/v1` 严格 unknown-field 校验。
+- 节点必须连续为 `node0...nodeN`，`role` 必填且允许重复。
+- plan 引用必须是目录内普通文件，拒绝 `..` 和 symlink 逃逸。
+- readiness、gateway 端口、health path、slug、step id 和 hosts IPv4 完整校验。
+- `--validate-only` 可选校验 hosts，并输出展开后的拓扑、地址、网卡和 endpoint。
 
-三、四节点继续使用 `node2`、`node3`。多个节点可以拥有相同角色：
+### Runner/process/coordinator
 
-```yaml
-nodes:
-  - id: node0
-    role: prefill
-  - id: node1
-    role: decode
-  - id: node2
-    role: decode
-  - id: node3
-    role: decode
-```
+- `process.py` 集中处理独立 process group、日志尾部、SIGINT/SIGTERM cancellation、
+  TERM/KILL 和存活验证。
+- check/evaluation 改为受监管子进程；运行期间持续检查本机服务、gateway、远端失败、
+  timeout 和 cancellation。
+- Coordinator 状态统一为 `running/passed/failed/cancelled`，节点状态为
+  `pending/ready/failed/cleaned`；重复请求幂等，terminal 不可修改，客户端只有限重试
+  连接错误、408、429 和 5xx。
+- terminal 先发布；每节点真实清理、关闭日志并写完 `node-result.json` 后才上报 cleaned。
+- leader 硬退出时，worker 在 coordinator unreachable grace 后自行失败并清理。
+- 不使用全局 `pkill/killall`，不删除用户代理变量。
 
-相关规则：
+### Result/artifact
 
-- `id` 是稳定执行实例编号，同时对应 `nodes/<id>/`、`hosts.yaml` key 和 `--node-id`。
-- `role` 描述 `prefill`、`decode`、`api`、`headless` 等服务职责。
-- Runner 注入 `RECIPE_NODE_ID`、`RECIPE_NODE_INDEX` 和 `RECIPE_NODE_ROLE`。
-- Runner 同时注入 `RECIPE_NODE_0_IP`、`RECIPE_NODE_1_IP` 等地址。
-- plan 列表中的第一个节点默认是 HTTP 控制 leader；这不等同于 DP master 或服务角色。
-- gateway 默认由第一个节点启动。
-- headless 节点可以没有 `readiness`；无 gateway 时第一个节点必须有 HTTP readiness，
-  因为它定义 checks/evaluations 使用的 endpoint。
-- 每个节点必须拥有独立 launch 脚本。服务参数、HCCL/vLLM 环境变量和 rank 设置保留在
-  节点脚本中，不进入 Runner。
-- plan 不保存真实 IP、Runner label、Kubernetes 字段等基础设施内容。
+- `result.py` 提供单一 `RunFailure`、UTC 时间、原子 JSON 和结果合并。
+- 每节点写 `environment.json`、`node-result.json`；leader 写 `result.json`。
+- 第一个执行错误保留为 primary failure，cleanup error 单独记录。
+- coordinator 不传日志；本地节点各自保留 artifact，K8s CI 的 Pod 把 artifact 写到共享
+  PVC，控制器 Job 负责打包上传。PVC 不参与状态协调。
 
-## 4. Runner 已实现的生命周期
+### AISBench
+
+- `install_aisbench.sh` 固定：
+
+  ```text
+  tag    v3.1-20260609-master
+  commit 0da56eadb2ac85c31c2540f4f5b69af3ec5717a5
+  ```
+
+- 正确版本重复执行直接复用；错误版本默认失败，只有 `--force-reinstall` 才替换。
+- 默认尊重已有 pip 配置，可通过 `AIS_BENCH_VENV` 隔离依赖。
+- `aisbench.py` 完成命令/config/dataset/artifact preflight，并把 accuracy/performance
+  产物转换为通用 `RECIPE_STEP_RESULT_FILE`。
+- 默认少量样本是 smoke；配置 baseline/allowed-drop 才进行 accuracy gate。
+- performance 提取 TTFT、TPOT、E2E、output token/s 和 request/s。
+
+### DeepSeek V4 与 workflow
+
+- 新增 `configs/recipe_ci/plans/deepseek-v4-flash-a3-pd/`，参数手工对齐
+  `models/en/DeepSeek/DeepSeek-V4-Flash.yaml` A3 1P1D 段。
+- node0/node1 使用上游 `launch_online_dp.py` 和各自 `run_dp_template.sh`。
+- gateway 显式列出 4 个 Prefill 和 16 个 Decode backend。
+- completion、accuracy、performance 均为 plan-local 内容。
+- `.github/workflows/recipe_verify_multi_node.yaml` 只负责手动输入，并调用
+  `_recipe_verify_multi_node.yaml` reusable workflow；当前默认用例是 DeepSeek V4 双节点，
+  但通用执行层不包含用例或双节点语义。
+- reusable workflow 复用 vLLM Ascend 的单 controller Job + `LeaderWorkerSet` 方案，严格
+  解析 `len(plan.nodes)` 作为 LWS size，并动态枚举任意 `node0...nodeN` Pod。
+- controller 把指定 ref（留空则为 workflow commit）的同一份 recipes 源码暂存到 PVC，
+  所有 16 卡 A3 Pod 直接运行 `scripts/recipe_ci/run.sh`；入口根据
+  `LWS_WORKER_INDEX` 选择 node0...nodeN，并由 LWS DNS 动态生成 `hosts.yaml`。
+- 本地与 LWS 只有一个公开入口。CI 由 LWS/Workflow 注入环境变量；本地手动
+  设置相同的 `LWS_WORKER_INDEX`、`RECIPE_CI_CLUSTER_IPS`、网卡和可见卡。
+- Runner 仍用 HTTP coordinator；共享 PVC 只传源码、artifact 和 Ascend plog。控制器
+  动态流式输出所有 Pod 日志、检查全部 exit code、删除 LWS 并始终上传 bundle。
+
+## 本地执行
+
+镜像内推荐目录：
 
 ```text
-各节点解析同一个 plan 和 hosts
-             ↓
-第一个节点启动 HTTP coordinator
-             ↓
-每个节点以 nodes/nodeN 为 cwd 启动自己的 run.sh
-             ↓
-有 readiness 的节点等待本机全部 /health
-             ↓
-所有节点向 coordinator 上报 ready
-             ↓
-leader 可选启动 gateway 并等待 /healthcheck
-             ↓
-leader 依次执行 checks
-             ↓
-leader 按 --evaluation 执行 accuracy/performance
-             ↓
-发布 done/failed，所有节点收集日志并清理各自进程组
+/vllm-workspace/vllm-ascend
+/vllm-workspace/vllm-ascend-recipes
 ```
 
-以节点目录作为工作目录非常重要：上游 `launch_online_dp.py` 会从当前目录读取
-`./run_dp_template.sh`。
+本地手动 clone recipes 后，在所有机器准备相同 commit、镜像、模型，
+按 `node0...nodeN` 顺序设置同一份 IP 列表，然后分别前台运行。node0 示例：
 
-Runner 当前 CLI：
-
-```text
---plan
---hosts
---node-id
---model-path
---vllm-ascend-root
---control-port                 默认 29599
---startup-timeout-seconds      默认 1800
---run-timeout-seconds          默认 3600
---evaluation                  none/accuracy/performance/all
---artifact-root               默认 /tmp/recipe-ci
---validate-only
+```bash
+export RECIPE_CI_PLAN=configs/recipe_ci/plans/deepseek-v4-flash-a3-pd/plan.yaml
+export RECIPE_CI_MODEL_PATH=/path/to/DeepSeek-V4-Flash-w8a8-mtp
+export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
+export RECIPE_CI_INTERFACE="<local_interface>"
+export LWS_WORKER_INDEX=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export RECIPE_CI_EVALUATION=none
+scripts/recipe_ci/run.sh
 ```
 
-## 5. 当前两个用例
+另一台只把 `LWS_WORKER_INDEX` 改为 `1`，并按本机资源设置网卡和空闲卡。
+这与 CI 执行同一个 shell 入口和 Runner/HTTP 流程，不需要
+本地 Actions 模拟器、Kubernetes、共享文件系统或新建 SSH orchestration 层。
 
-### 5.1 DeepSeek-V2-Lite P/D 双节点四卡
+AISBench 不在基础镜像时：
 
-目录：`configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c`
-
-拓扑：
-
-```text
-node0, role=prefill
-  launch_online_dp.py 启动 2 个 TP1 Prefill 实例，端口 7100/7101
-
-node1, role=decode
-  launch_online_dp.py 启动 2 个 TP1 Decode 实例，端口 7100/7101
-
-node0 gateway
-  load_balance_proxy_server_example.py，端口 38085
+```bash
+scripts/recipe_ci/install_aisbench.sh
 ```
 
-运行镜像必须提供：
-
-```text
-/vllm-workspace/vllm-ascend/examples/external_online_dp/launch_online_dp.py
-/vllm-workspace/vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
-```
-
-Prefill/Decode 的 vLLM 参数、KV connector 和环境变量分别位于：
-
-```text
-nodes/node0/run_dp_template.sh
-nodes/node1/run_dp_template.sh
-```
-
-gateway 显式使用 `RECIPE_NODE_0_IP` 作为 Prefill、`RECIPE_NODE_1_IP` 作为 Decode。
-
-### 5.2 Qwen3-30B-A3B 普通内部 DP 双节点四卡
-
-目录：`configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c`
-
-该用例不使用 P/D、不使用外部 DP launcher，也不需要 proxy：
-
-```text
-node0, role=api
-  API server + DP rank 0/1，data-parallel-size-local=2
-
-node1, role=headless
-  headless DP rank 2/3，data-parallel-start-rank=2
-
-全局 DP4、TP1，node0:7100 是唯一 endpoint
-```
-
-两个节点都直接执行 `vllm serve`。普通 external DP proxy 示例已经不再作为当前方案；
-当前普通 DP 使用 vLLM 内置的多节点 DP 和 API 负载均衡能力。
-
-Qwen MoE 在当前实机镜像中使用图模式 profile 时出现过本地 DP 设备混用，因此当前脚本
-与上游 internal-DP 示例对齐，包含：
-
-```text
---enforce-eager
---no-enable-prefix-caching
---max-num-batched-tokens 4096
---gpu-memory-utilization 0.9
-```
-
-普通 DP 用例会把整个 `ASCEND_RT_VISIBLE_DEVICES` 交给 vLLM，因此双卡测试时应只设置
-两张卡，例如 `4,5`。P/D 用例的 launcher 模板会从候选卡列表中按逻辑 index 选择卡。
-
-## 6. AISBench 方案
-
-### 6.1 安装
-
-`scripts/recipe_ci/install_aisbench.sh` 复现 vLLM Ascend
-`.github/workflows/dockerfiles/Dockerfile.nightly.a3` 的主要安装过程：
-
-```text
-默认 tag: v3.1-20260609-master
-默认源码: https://github.com/AISBench/benchmark.git
-默认目录: /vllm-workspace/vllm-ascend/benchmark
-安装方式: pip install -e . -r requirements/api.txt -r requirements/extra.txt
-```
-
-建议在干净容器中只安装一次固定 tag，不要先安装 moving master 再覆盖。脚本当前不是
-幂等的：目标目录已存在时 `git clone` 会失败，这是第二阶段需要补充的防御性能力。
-
-nightly Dockerfile 使用系统 Python 安装，因此本地默认也保持一致。脚本保留可选
-`AIS_BENCH_VENV`，但它不是当前推荐主路径。
-
-Dockerfile 构建成功不等于整个基础镜像能通过 `pip check`。当前容器中的 `te`、
-`ms-service-profiler`、FastAPI/Starlette/OpenCV metadata 冲突不能全部归因于固定版
-AISBench；功能验收以 `ais_bench -h` 和真实小数据集评测为准。
-
-### 6.2 plan-local 配置
-
-每个 plan 自带两个 AISBench 请求配置：
-
-```text
-vllm_api_general_chat.py  -> accuracy，stream=False
-vllm_api_stream_chat.py   -> performance，stream=True
-```
-
-两个配置都读取 Runner 注入的 endpoint、模型路径和 served model。不要重新合并为一个
-由 `RECIPE_AISBENCH_STREAM` 切换的文件；分开后更接近 AISBench/nightly 模板，也更适合
-作为 Recipe 转换产物审查。
-
-accuracy/performance 脚本通过 `--config-dir "$RECIPE_PLAN_DIR/aisbench"` 使用当前 plan，
-不修改 AISBench 安装目录中的默认配置。
-
-GSM8K 数据集需要位于：
+GSM8K 数据集目录默认是：
 
 ```text
 /vllm-workspace/vllm-ascend/benchmark/ais_bench/datasets/gsm8k
 ```
 
-## 7. 已完成验证
-
-### 7.1 本地测试
-
-最后一次本地结果：
+## CI 管理员需要配置
 
 ```text
-.venv/bin/python -m unittest tests.recipe_ci.test_multi_node_ci -v
-Ran 7 tests
-OK
+Variable: RECIPE_CI_K8S_CONTROLLER_RUNNER   # 可选
+Variable: RECIPE_CI_A3_RESOURCE_GROUP       # 可选
+Variable: RECIPE_CI_A3_PVC_NAME             # 可选
+Variable: RECIPE_CI_AISBENCH_DATASET_DIR    # 可选
+Secret:   KUBECONFIG_B64
+Secret:   RECIPE_CI_MODEL_PATH
 ```
 
-同时通过：
+模型路径必须能被所有 LWS Pod 访问，通常放在相同 PVC 中。CI 不需要配置节点 IP、网卡、
+两套 runner label 或空闲卡列表；Pod 调度和 16 卡分配由 K8s 完成。
 
-- `bash -n`：两个 plan 的节点、gateway、check、evaluation 脚本。
-- `python -m py_compile`：Runner、plan parser 和 AISBench 配置。
+## 已执行的本地验证
+
+- `.venv/bin/python -m unittest discover -s tests/recipe_ci -v`
+- Python `py_compile`：Plan、Runner、Coordinator、Process、Result、AISBench。
+- 所有 Recipe CI shell 脚本 `bash -n`。
+- 新增 DeepSeek V4 shell 脚本 `shellcheck`。
+- `actionlint`：手动入口和 `_recipe_verify_multi_node.yaml` reusable workflow。
+- workflow YAML/BaseLoader 静态结构检查。
 - `git diff --check`。
+- DeepSeek V4 plan 的统一入口 `RECIPE_CI_VALIDATE_ONLY=true` 校验。
 
-项目约定要求所有本地 Python 测试都在仓库 `.venv` 中执行。
+最终交接前必须重新执行完整检查并以最后一次输出为准。
 
-### 7.2 两台 NPU 机器
+## 2026-08-05 双节点轻量实机回归
 
-本轮使用过的环境：
-
-```text
-跳板: ssh a3-node0
-机器: node1 / node2
-容器: zsl_recipe
-当时节点 IP: 172.22.0.155 / 172.22.0.188
-当时网卡: enp23s0f3
-当时使用物理卡: 两台机器各 4,5
-```
-
-这些地址和空闲卡只代表当时状态。再次执行前必须重新运行 `npu-smi info`、确认 IP 和
-网卡，不能直接复用。
-
-AISBench 在两台容器中安装并验证过：
+使用两台专用 A3 容器对当前未提交工作区快照重新执行
+`deepseek-v2-lite-pd-2n2c`，没有验证 GitHub Actions/LWS：
 
 ```text
-package version: 3.1.20260609
-source commit: 0da56eadb2ac85c31c2540f4f5b69af3ec5717a5
-ais_bench -h: passed
+node1 -> Recipe node0 / Prefill / 172.22.0.155 / enp23s0f3 / 物理卡 4,5
+node2 -> Recipe node1 / Decode  / 172.22.0.188 / enp23s0f3 / 物理卡 0,1
+model -> /root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V2-Lite-W8A8
 ```
 
-Qwen 普通内部 DP 已实际端到端通过：
+上述 IP、网卡和空闲卡只代表本次运行，未写入 plan，下一次执行必须重新检查。两边使用
+同一份工作区归档，SHA256 为
+`726ad7bca3dddd592d22b5cd4dda699607cd9830ae98751e9a268d02a6e7f764`，解压到独立目录
+`/vllm-workspace/vllm-ascend-recipes-validation-20260805`，没有覆盖原 clone。
 
-- Gloo rank 0-3 跨两节点连接成功。
-- node0 `/health` 返回 200。
-- completion 请求成功。
-- 两个 Runner 均退出 0 并输出 `plan completed`。
-- AISBench accuracy 和 performance 阶段均完成。
-- performance 两个样本：E2E 约 3751.8 ms、TTFT 约 251.6 ms、TPOT 约
-  112.9 ms、输出吞吐约 8.529 token/s、请求吞吐约 0.2665 req/s。
-- accuracy 当时为快速打通流程而设置 `max_out_len=32`，两个 GSM8K 样本得分为 0；
-  该结果不能作为模型质量结论。
+验收结果：
 
-容器内曾保留的普通 DP 产物：
+- 每节点两个 TP1/DP2 vLLM 实例在 7100/7101 启动并通过 `/health`。
+- Decode 与 Prefill 的 Mooncake 链路建立，gateway completion 返回 HTTP 200。
+- 两节点 `node-result.json` 均为 `passed`，completion return code 为 0，无
+  `primary_failure`、`cleanup_errors` 或 warning。
+- leader 聚合 `result.json` 为 `passed`、`failure: null`，node0/node1 均为 `cleaned`，
+  `checks.completion.status` 为 `passed`。
+- Runner 完成后，目标端口全部关闭，Runner、vLLM、launcher、proxy 无残留，四张 NPU
+  均释放到系统基线。
+- vLLM 子进程收到正常 TERM 后打印了 multiprocessing resource tracker 警告及
+  `corrupted size vs. prev_size`。服务和 gateway 的 return code `-15` 是 Runner 的预期
+  生命周期清理，未导致框架失败；该底层退出告警仍值得在后续镜像/vLLM 版本回归中观察。
+
+远端 artifact 保留在：
 
 ```text
-/tmp/recipe-ci-internal-dp-retry2/qwen3-30b-a3b-dp-2n2c/
+/tmp/recipe-ci-phase2-rework-20260805/deepseek-v2-lite-pd-2n2c/
 ```
 
-### 7.3 必须注意的验证边界
-
-最后一次实机成功之后又发生了以下结构调整：
-
-- 所有节点目录统一为 `node0/node1`。
-- plan 增加必填 `role`。
-- AISBench 从共享配置改为每个 plan 自带两个配置文件。
-- evaluation 脚本改为 plan-local `--config-dir`。
-
-这些调整通过了本地回归，但尚未使用最新工作区重新跑两节点 NPU。DeepSeek P/D 用例也
-应以当前最终目录和 plan 重新完整验证。换设备后的第一项实机工作应是同时回归 P/D 和
-普通 DP，而不能只依赖之前的成功结果。
-
-## 8. 当前 Git 和 Workflow 状态
-
-当前工作区包含大量未提交修改及新文件。高层次内容包括：
-
-- `scripts/recipe_ci/plan.py`、`runner.py` 生命周期和 schema 调整。
-- 两个 plan 的节点、gateway、checks、evaluations 和 README。
-- 两个 plan 各自的 AISBench model 配置。
-- AISBench 安装脚本。
-- 测试和 `docs/MULTI_NODE_RECIPE_CI.md`。
-- P/D 节点目录从 `prefill/decode` 重命名为 `node0/node1`。
-- 普通 DP 删除旧 external launcher/proxy 模板，改为内部 DP。
-
-仓库当前不存在 `.github/workflows/recipe_verify_multi_node.yaml`。现有：
+统一入口改造后又在同两个专用容器中重跑了最新工作区快照：
 
 ```text
-.github/workflows/_recipe_verify.yml
-.github/workflows/pr-recipe-verify.yml
-.github/workflows/nightly-recipe-verify.yml
+node1 -> LWS_WORKER_INDEX=0 / 172.22.0.155 / 物理卡 0,1
+node2 -> LWS_WORKER_INDEX=1 / 172.22.0.188 / 物理卡 0,1
+snapshot -> /vllm-workspace/vllm-ascend-recipes-unified-20260805
+artifact -> /tmp/recipe-ci-unified-20260805/deepseek-v2-lite-pd-2n2c
 ```
 
-仍然执行旧的单 Recipe `scripts/verify-recipe.sh` 路径，没有接入
-`scripts/recipe_ci/run.sh` 和多节点 plan。不能把当前框架描述为已经接入 GitHub Actions。
+两边都只设置同一套环境变量并执行 `scripts/recipe_ci/run.sh`。入口正确完成
+`LWS_WORKER_INDEX -> node id`、临时 hosts 和可见卡映射；两个 node result 及 leader
+aggregate 都是 `passed`，completion 通过，node0/node1 都是 `cleaned`，没有
+primary failure、cleanup error、warning 或相关残留进程。
 
-## 9. 换设备前和换设备后的操作
+## 尚未完成或仍需外部资源
 
-### 9.1 当前设备上必须先做
+- 尚未在两台 16 卡 A3 节点真实启动 DeepSeek V4 1P1D；这是最重要的剩余验收。
+- 尚未在真实 K8s controller runner 上执行 workflow_dispatch；kubeconfig、PVC、LWS
+  controller、模型路径、Pod 取消和 plog 收集仍需管理员环境实测。
+- AISBench wrapper 已按固定 tag 源码格式和既有真实产物编写，但仍需用 DeepSeek V4 的
+  一次 accuracy/performance 实跑确认产物与 score baseline。
+- 当前不做三/四节点、Recipe converter、共享文件 coordinator、PR/nightly 自动触发。
+- leader SIGKILL/机器掉电只能由 worker 检测 coordinator 不可达，无法保证收到 leader
+  主动发布的具体失败原因。
 
-```bash
-cd /Users/user/work/MrZ20/vllm-ascend-recipes
-git status --short
-git diff --check
-git add -A
-git status --short
-git commit -m "Add maintainable multi-node recipe CI runner"
-git push origin add_mul_ci
-```
-
-提交信息由维护者最终决定。不要只复制本文而遗漏未提交源码。
-
-如果暂时不希望提交，可至少生成补丁并另行保存：
-
-```bash
-git diff --binary > multi-node-recipe-ci.patch
-```
-
-注意：普通 `git diff` 不包含未跟踪文件；生成补丁前需要先 `git add -N` 或使用 Git 提交
-方案。最稳妥的迁移方式仍是提交并推送分支。
-
-### 9.2 新设备续接
-
-```bash
-git clone --branch add_mul_ci https://github.com/MrZ20/vllm-ascend-recipes.git
-cd vllm-ascend-recipes
-git status
-```
-
-按仓库开发约定创建/使用本地 `.venv`，安装 PyYAML 等测试依赖，然后运行：
-
-```bash
-.venv/bin/python -m unittest tests.recipe_ci.test_multi_node_ci -v
-git diff --check
-```
-
-实机运行时，容器中的推荐布局为：
-
-```text
-/vllm-workspace/
-├── vllm-ascend/          # 镜像自带
-└── vllm-ascend-recipes/  # clone 当前分支
-```
-
-主流程始终从 recipes 仓库执行。每个用例的 hosts 和双节点命令以各自 README 为准。
-
-## 10. 后续任务优先级
-
-### P0：保存当前成果
-
-- 审查 `git diff`。
-- `git add -A`，确认目录 rename 和新 AISBench 文件全部纳入。
-- 提交并推送 `add_mul_ci`。
-
-### P0：最新代码双节点回归
-
-- 使用最新的 `node0/node1 + role` plan 重新跑 DeepSeek P/D。
-- 重新跑 Qwen 普通内部 DP。
-- 两个用例都执行 completion、accuracy、performance。
-- accuracy 使用足够的 `max_out_len`，把流程 smoke 与真实质量验证分开。
-- 确认失败和成功后两台机器都无残留 vLLM/proxy/AISBench 进程。
-- 保存完整 artifact 和所用镜像、vLLM、vllm-ascend、AISBench commit 信息。
-
-### P1：接入 CI
-
-- 新增或重构真正的多节点 workflow；不要与当前单节点 `_recipe_verify.yml` 混为一谈。
-- 明确两个 self-hosted runner 如何获得相同 plan、hosts 和模型路径。
-- CI 应提前 checkout 或挂载 recipes 源码；本地首次验证仍可使用容器启动后 clone。
-- 定义手工 IP/hosts 输入、节点身份、卡选择和并发互斥方式。
-- 收集两个节点日志和 leader 的 checks/evaluations artifacts。
-- workflow 只处理基础设施编排，不复制 Runner 内部生命周期。
-
-### P1：Recipe 到中间态转换
-
-- Recipe 文档格式确定后实现转换器。
-- 转换器生成 `plan.yaml`、每节点脚本、gateway/check/evaluation 和 AISBench 配置。
-- 保持生成目录自包含，不依赖全局隐藏模板。
-- 明确 Recipe 字段、运行时字段和基础设施字段的归属。
-
-### P1：三节点和四节点设计验证
-
-- 使用 `node0...nodeN` 和可重复 `role` 验证多个 Decode/headless 节点。
-- gateway backend 列表应由转换产物明确展开，不让 Runner 理解 P/D 拓扑。
-- 检查多节点 DP rank、local size、start rank 和端口分配。
-- 当前 `role` 主要用于可读性和环境注入，尚未实现按 role 自动聚合 IP；不要在 Runner
-  中过早加入 P/D 专属逻辑。
-
-### P1：AISBench 上游边界
-
-- recipes 只保留评测选择、数据集、样本数、baseline 策略和 artifact 收集。
-- 可向 vLLM Ascend 的 `tools/aisbench.py` 推动：自定义 executable、work/config/output
-  目录、served name 与模型路径分离、机器可读结果。
-- 更通用的 endpoint CLI 和稳定配置接口应推动到 AISBench 上游。
-- 在上游接口稳定前，plan-local 两个 Python 配置是临时但可读的适配层，不应发展为
-  recipes 自己维护的 AISBench fork。
-
-### P2：第二阶段防御性能力
-
-- 让 `install_aisbench.sh` 支持已存在目录、版本校验和明确升级/重装行为。
-- 补充 node id 连续编号、role 合法性、端口冲突等 schema 校验。
-- 增加更明确的环境和上游工具 preflight。
-- 改进超时、错误传播、失败 artifact 和残留进程诊断。
-- 评估协调器存储接口，使 HTTP 与共享文件系统实现可替换；当前 HTTP 已支持本地无共享
-  文件系统场景，不需要为第一阶段改写。
-
-## 11. 继续开发时容易踩的点
-
-- 不要在 `/vllm-workspace/vllm-ascend` 中运行 Recipe CI 主流程；该目录只是运行时依赖。
-- 不要假设 `pip install vllm-ascend` 会包含 examples；官方镜像中的完整源码才提供这些
-  launcher/proxy 脚本。
-- 不要把 P/D 的 `launch_online_dp.py` 用于普通内部 DP。
-- 不要恢复已经删除的普通 external DP proxy 方案。
-- 不要让 Runner 展开 DP rank 或理解 KV connector；这些属于节点脚本。
-- 不要把 HCCL/vLLM 服务环境变量重新塞回 plan 顶层。
-- 不要把 node id 改回角色名；节点使用 `nodeN`，角色使用 `role`。
-- 不要把 accuracy/performance 再合并为一个通过环境变量切换 stream 的 AISBench 配置。
-- 不要把 `aisbench/models` 压平，`models/` 是 AISBench config-dir 的固定分类。
-- 不要在通用流程中清除代理变量。
-- 不要把两条、32 token 的 GSM8K smoke 结果当作准确率结论。
-- 重新实机测试前必须检查 NPU 占用，不能默认物理卡 4、5 仍然空闲。
-
-## 12. 完成标准
-
-这项任务可以在满足以下条件后进入下一阶段：
-
-- 当前工作区已提交并推送。
-- 最新代码的 P/D 和普通内部 DP 均在两节点完成真实推理。
-- completion、accuracy、performance 和 artifact 收集均通过。
-- 三/四节点中间态能够用 `nodeN + role` 无歧义表达。
-- 多节点 workflow 能在目标 self-hosted runner 环境启动两个节点并汇总结果。
-- Recipe 文档稳定后，转换器能够生成与当前手工 plan 等价的自包含目录。
-
+详细设计与契约见 `docs/MULTI_NODE_RECIPE_CI.md`；原始第二阶段任务书保留在
+`MULTI_NODE_RECIPE_CI_PHASE2_AGENT_TASK.md`，但其中三/四节点要求已被本轮用户指令覆盖。

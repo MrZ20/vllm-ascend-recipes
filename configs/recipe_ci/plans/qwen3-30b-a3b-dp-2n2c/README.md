@@ -48,46 +48,39 @@ git clone --branch <your-branch> --depth 1 \
 cd /vllm-workspace/vllm-ascend-recipes
 ```
 
-两台机器填写完全相同的 hosts 文件：
-
-```bash
-cp configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/hosts.example.yaml \
-  /tmp/qwen3-dp-hosts.yaml
-vi /tmp/qwen3-dp-hosts.yaml
-```
+两台机器通过相同的 `RECIPE_CI_CLUSTER_IPS` 提供按 `node0,node1` 排列的集群地址。
 
 ## 启动
 
 先做静态校验：
 
 ```bash
-scripts/recipe_ci/run.sh \
-  --plan configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml \
-  --validate-only
+RECIPE_CI_PLAN=configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml \
+RECIPE_CI_VALIDATE_ONLY=true scripts/recipe_ci/run.sh
 ```
 
 API 机器作为 `node0` 执行：
 
 ```bash
+export RECIPE_CI_PLAN=configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml
+export RECIPE_CI_MODEL_PATH=/models/Qwen3-30B-A3B
+export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
+export RECIPE_CI_INTERFACE="<local_interface>"
+export LWS_WORKER_INDEX=0
 export ASCEND_RT_VISIBLE_DEVICES=4,5
-
-scripts/recipe_ci/run.sh \
-  --plan configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml \
-  --hosts /tmp/qwen3-dp-hosts.yaml \
-  --node-id node0 \
-  --model-path /models/Qwen3-30B-A3B
+scripts/recipe_ci/run.sh
 ```
 
 Headless 机器作为 `node1` 执行：
 
 ```bash
+export RECIPE_CI_PLAN=configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml
+export RECIPE_CI_MODEL_PATH=/models/Qwen3-30B-A3B
+export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
+export RECIPE_CI_INTERFACE="<local_interface>"
+export LWS_WORKER_INDEX=1
 export ASCEND_RT_VISIBLE_DEVICES=4,5
-
-scripts/recipe_ci/run.sh \
-  --plan configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml \
-  --hosts /tmp/qwen3-dp-hosts.yaml \
-  --node-id node1 \
-  --model-path /models/Qwen3-30B-A3B
+scripts/recipe_ci/run.sh
 ```
 
 启动顺序没有要求。`node0` 同时是默认控制 leader，并承担 `api` 和 DP coordinator
@@ -108,7 +101,7 @@ rank 已连接。每节点直接消费 `ASCEND_RT_VISIBLE_DEVICES` 中的两张�
 ```
 
 默认不运行评测。确认 AISBench 及 GSM8K 数据集已按 `docs/MULTI_NODE_RECIPE_CI.md`
-安装后，可在 `node0` 命令增加 `--evaluation accuracy`、`performance` 或 `all`。plan 内的
+安装后，可在 `node0` 设置 `RECIPE_CI_EVALUATION=accuracy`、`performance` 或 `all`。plan 内的
 `vllm_api_general_chat.py` 和 `vllm_api_stream_chat.py` 分别供精度和性能评测使用，
 并自动读取当前 endpoint 和 served model；样本数可通过
 `RECIPE_AISBENCH_ACCURACY_NUM_PROMPTS` 和

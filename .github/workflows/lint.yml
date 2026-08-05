@@ -132,7 +132,8 @@ jobs:
         run: |
           find configs/recipe_ci/plans -mindepth 2 -maxdepth 2 -name plan.yaml -print0 |
             while IFS= read -r -d '' plan; do
-              python scripts/recipe_ci/runner.py --plan "$plan" --validate-only
+              RECIPE_CI_PLAN="$plan" RECIPE_CI_VALIDATE_ONLY=true \
+                scripts/recipe_ci/run.sh
             done
 
       - name: Check shell entrypoints
