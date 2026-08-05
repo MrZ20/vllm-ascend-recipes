@@ -9,9 +9,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts/recipe_ci/install_aisbench.sh"
+CONSTRAINTS = ROOT / "scripts/recipe_ci/aisbench-constraints.txt"
 
 
 class AisbenchInstallerTests(unittest.TestCase):
+    def test_installer_is_executable(self) -> None:
+        self.assertTrue(os.access(INSTALLER, os.X_OK))
+
+    def test_opencv_is_pinned_to_the_last_numpy_1_compatible_release(self) -> None:
+        self.assertIn("--constraint", INSTALLER.read_text(encoding="utf-8"))
+        self.assertEqual(
+            CONSTRAINTS.read_text(encoding="utf-8").splitlines()[-1],
+            "opencv-python-headless==4.11.0.86",
+        )
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
@@ -81,6 +92,40 @@ class AisbenchInstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("already installed", result.stdout)
         self.assertIn(self.commit, result.stdout)
+
+    def test_cached_source_is_reused_when_the_command_needs_installing(self) -> None:
+        command = self.bin_dir / "ais_bench"
+        command.unlink()
+        fake_python = self.bin_dir / "python3"
+        fake_python.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '#!/usr/bin/env bash\\nexit 0\\n' > \"$FAKE_AISBENCH_COMMAND\"\n"
+            "chmod +x \"$FAKE_AISBENCH_COMMAND\"\n",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        environment = self.environment()
+        environment["FAKE_AISBENCH_COMMAND"] = str(command)
+
+        result = subprocess.run(
+            ["bash", str(INSTALLER)],
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Reusing cached AISBench source", result.stdout)
+        self.assertTrue(command.exists())
+
+    def test_clone_uses_http1_and_retries_before_publishing_the_cache(self) -> None:
+        text = INSTALLER.read_text(encoding="utf-8")
+
+        self.assertIn("for attempt in 1 2 3", text)
+        self.assertIn("git -c http.version=HTTP/1.1 clone", text)
+        self.assertIn('clone_root="${AIS_BENCH_ROOT}.clone.$$"', text)
+        self.assertIn('mv "$clone_root" "$AIS_BENCH_ROOT"', text)
 
     def test_wrong_commit_requires_force(self) -> None:
         environment = self.environment()

@@ -6,7 +6,11 @@ metadata:
 
 model:
   id: Qwen/Qwen3-30B-A3B
+  cache_path: Qwen/Qwen3-30B-A3B
   served_name: qwen3
+
+resources:
+  npu_per_node: 2
 
 nodes:
   - id: node0

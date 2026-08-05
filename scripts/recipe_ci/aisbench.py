@@ -44,6 +44,10 @@ def parse_args() -> argparse.Namespace:
     performance = subparsers.add_parser("performance")
     performance.add_argument("--artifact-directory", type=Path, required=True)
     performance.add_argument("--result-file", type=Path, required=True)
+
+    render = subparsers.add_parser("render-model-config")
+    render.add_argument("--template", type=Path, required=True)
+    render.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
 
@@ -53,6 +57,33 @@ def newest_files(directory: Path, suffix: str) -> list[Path]:
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
+
+
+def render_model_config(template: Path, output: Path) -> None:
+    substitutions = {
+        "__RECIPE_MODEL_PATH__": ("RECIPE_MODEL_PATH", None, False),
+        "__RECIPE_SERVED_MODEL_NAME__": (
+            "RECIPE_SERVED_MODEL_NAME",
+            None,
+            False,
+        ),
+        "__RECIPE_ENDPOINT_HOST__": ("RECIPE_ENDPOINT_HOST", None, False),
+        "__RECIPE_ENDPOINT_PORT__": ("RECIPE_ENDPOINT_PORT", None, True),
+        "__RECIPE_AISBENCH_MAX_OUT_LEN__": (
+            "RECIPE_AISBENCH_MAX_OUT_LEN",
+            "512",
+            True,
+        ),
+    }
+    content = template.read_text(encoding="utf-8")
+    for placeholder, (name, default, numeric) in substitutions.items():
+        value = os.environ.get(name, default)
+        if not value:
+            raise RuntimeError(f"required environment variable is missing: {name}")
+        replacement = str(int(value)) if numeric else repr(value)
+        content = content.replace(placeholder, replacement)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(content, encoding="utf-8")
 
 
 def preflight(args: argparse.Namespace) -> None:
@@ -194,6 +225,9 @@ def relative_artifacts(paths: Iterable[Path], root: Path) -> list[str]:
 def main() -> int:
     args = parse_args()
     try:
+        if args.action == "render-model-config":
+            render_model_config(args.template, args.output)
+            return 0
         if args.action == "preflight":
             preflight(args)
             return 0

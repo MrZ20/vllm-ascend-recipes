@@ -43,7 +43,12 @@ class StrictPlanTests(unittest.TestCase):
             "api_version": "recipe-ci/v1",
             "kind": "MultiNodePlan",
             "metadata": {"name": "phase2-plan"},
-            "model": {"id": "example/model", "served_name": "example"},
+            "model": {
+                "id": "example/model",
+                "cache_path": "example/model",
+                "served_name": "example",
+            },
+            "resources": {"npu_per_node": 2},
             "nodes": [
                 {
                     "id": "node0",
@@ -152,6 +157,17 @@ class StrictPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanError, "at least two"):
             load_plan(self.write_plan(data))
 
+    def test_model_cache_path_is_relative(self) -> None:
+        plan = load_plan(self.write_plan())
+        self.assertEqual(plan.model.cache_path, "example/model")
+
+        for cache_path in ("/models/example", "../example"):
+            with self.subTest(cache_path=cache_path):
+                data = copy.deepcopy(self.plan_data)
+                data["model"]["cache_path"] = cache_path
+                with self.assertRaisesRegex(PlanError, r"model\.cache_path"):
+                    load_plan(self.write_plan(data))
+
     def test_duplicate_roles_are_valid(self) -> None:
         data = copy.deepcopy(self.plan_data)
         data["nodes"][0]["role"] = "decode"
@@ -160,6 +176,17 @@ class StrictPlanTests(unittest.TestCase):
         plan = load_plan(self.write_plan(data))
 
         self.assertEqual([node.role for node in plan.nodes], ["decode", "decode"])
+
+    def test_npu_per_node_is_required_and_positive(self) -> None:
+        plan = load_plan(self.write_plan())
+        self.assertEqual(plan.resources.npu_per_node, 2)
+
+        for value in (0, True, None):
+            with self.subTest(npu_per_node=value):
+                data = copy.deepcopy(self.plan_data)
+                data["resources"]["npu_per_node"] = value
+                with self.assertRaisesRegex(PlanError, r"resources\.npu_per_node"):
+                    load_plan(self.write_plan(data))
 
     def test_safe_slugs_and_stage_local_step_ids(self) -> None:
         cases = (
@@ -198,6 +225,7 @@ class StrictPlanTests(unittest.TestCase):
             ((), r"plan has unknown fields"),
             (("metadata",), r"metadata has unknown fields"),
             (("model",), r"model has unknown fields"),
+            (("resources",), r"resources has unknown fields"),
             (("nodes", 0), r"nodes\[0\] has unknown fields"),
             (
                 ("nodes", 0, "readiness"),
@@ -364,6 +392,7 @@ class StrictPlanTests(unittest.TestCase):
         self.assertIn("Plan: phase2-plan", static_summary)
         self.assertIn("API version: recipe-ci/v1", static_summary)
         self.assertIn("Leader: node0", static_summary)
+        self.assertIn("NPUs per node: 2", static_summary)
         self.assertIn(
             "node0 role=prefill launch=nodes/node0/run.sh readiness=7100-7101",
             static_summary,

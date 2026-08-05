@@ -323,6 +323,15 @@ class CoordinatorClientRetryTests(unittest.TestCase):
         self.assertEqual(opener.calls, 2)
         self.assertEqual(state["status"], "failed")
 
+    def test_wait_available_recovers_after_a_full_retry_window(self) -> None:
+        client, opener = self.make_client(
+            [refused(), refused(), refused(), FakeResponse({"status": "running"})]
+        )
+
+        client.wait_available(3, lambda: None)
+
+        self.assertEqual(opener.calls, 4)
+
     def test_invalid_json_response_is_not_retried(self) -> None:
         client, opener = self.make_client(
             [FakeResponse(raw=b"not-json"), FakeResponse({"status": "passed"})]

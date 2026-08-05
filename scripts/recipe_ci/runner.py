@@ -58,6 +58,7 @@ from scripts.recipe_ci.result import (  # noqa: E402
 
 
 DEFAULT_VLLM_ASCEND_ROOT = Path("/vllm-workspace/vllm-ascend")
+MODEL_CACHE_ROOT = Path("/root/.cache/modelscope/hub/models")
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -78,16 +79,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--hosts", type=Path)
     parser.add_argument("--node-id")
-    parser.add_argument("--model-path")
     parser.add_argument("--vllm-ascend-root", type=Path)
     parser.add_argument("--control-port", type=int, default=29599)
     parser.add_argument("--startup-timeout-seconds", type=int, default=1800)
     parser.add_argument("--run-timeout-seconds", type=int, default=3600)
-    parser.add_argument(
-        "--evaluation",
-        choices=("none", "accuracy", "performance", "all"),
-        default="none",
-    )
     parser.add_argument("--artifact-root", type=Path, default=Path("/tmp/recipe-ci"))
     parser.add_argument("--validate-only", action="store_true")
     return parser.parse_args()
@@ -95,6 +90,7 @@ def parse_args() -> argparse.Namespace:
 
 def interface_addresses() -> dict[str, str]:
     """Return Linux interface-to-IPv4 mappings used for local node selection."""
+    addresses: dict[str, str] = {}
     try:
         result = subprocess.run(
             ["ip", "-o", "-4", "addr", "show"],
@@ -104,13 +100,31 @@ def interface_addresses() -> dict[str, str]:
             stderr=subprocess.DEVNULL,
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
-        return {}
+        pass
+    else:
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 4:
+                addresses[fields[1]] = fields[3].split("/", 1)[0]
+        if addresses:
+            return addresses
 
-    addresses: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) >= 4:
-            addresses[fields[1]] = fields[3].split("/", 1)[0]
+    # Minimal runtime images may not contain iproute2. SIOCGIFADDR keeps local
+    # and hostNetwork execution usable without adding another image dependency.
+    try:
+        import fcntl
+        import struct
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            for _, interface in socket.if_nameindex():
+                try:
+                    request = struct.pack("256s", interface[:15].encode())
+                    response = fcntl.ioctl(probe.fileno(), 0x8915, request)
+                except OSError:
+                    continue
+                addresses[interface] = socket.inet_ntoa(response[20:24])
+    except (ImportError, OSError):
+        pass
     return addresses
 
 
@@ -396,9 +410,7 @@ def run_node(
 ) -> None:
     host = hosts[node.id]
     interface = select_interface(host)
-    model_path = (
-        args.model_path or os.environ.get("RECIPE_CI_MODEL_PATH") or plan.model.id
-    )
+    model_path = str(MODEL_CACHE_ROOT / plan.model.cache_path)
     plan_artifact_directory = (args.artifact_root / plan.name).resolve()
     artifact_directory = plan_artifact_directory / node.id
     artifact_directory.mkdir(parents=True, exist_ok=True)
@@ -443,6 +455,10 @@ def run_node(
 
     with signal_cancellation_event() as cancellation:
         try:
+            def check_cancellation() -> None:
+                if cancellation.is_set():
+                    raise CancellationRequested("cancellation requested")
+
             if node.id == plan.leader.id:
                 coordinator = LeaderCoordinator(
                     [item.id for item in plan.nodes],
@@ -450,6 +466,11 @@ def run_node(
                     artifact_directory / "coordinator.log",
                 )
                 coordinator.start()
+            else:
+                print(f"[{node.id}] waiting for the leader coordinator")
+                client.wait_available(
+                    args.startup_timeout_seconds, check_cancellation
+                )
 
             print(
                 f"[{node.id}] starting service launcher; "
@@ -468,8 +489,7 @@ def run_node(
             runtime_processes.append(service_process)
 
             def check_local_runtime() -> None:
-                if cancellation.is_set():
-                    raise CancellationRequested("cancellation requested")
+                check_cancellation()
                 check_processes(runtime_processes)
 
             try:
@@ -550,7 +570,7 @@ def run_node(
                     check_leader_runtime,
                     cancellation,
                 )
-                if args.evaluation in ("accuracy", "all"):
+                if plan.evaluations.accuracy:
                     evaluation_results["accuracy"] = run_steps(
                         "accuracy",
                         plan.evaluations.accuracy,
@@ -561,7 +581,7 @@ def run_node(
                         check_leader_runtime,
                         cancellation,
                     )
-                if args.evaluation in ("performance", "all"):
+                if plan.evaluations.performance:
                     evaluation_results["performance"] = run_steps(
                         "performance",
                         plan.evaluations.performance,

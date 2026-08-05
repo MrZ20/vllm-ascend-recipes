@@ -34,7 +34,7 @@ docker run --rm -it \
   --network host \
   --ipc host \
   --shm-size 64g \
-  -v /path/on/host/DeepSeek-V2-Lite-W8A8:/models/DeepSeek-V2-Lite-W8A8:ro \
+  -v /path/on/host/DeepSeek-V2-Lite-W8A8:/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V2-Lite-W8A8:ro \
   quay.io/ascend/vllm-ascend:v0.22.1rc1 \
   bash
 ```
@@ -68,7 +68,6 @@ Prefill 机器作为 `node0` 执行：
 
 ```bash
 export RECIPE_CI_PLAN=configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml
-export RECIPE_CI_MODEL_PATH=/models/DeepSeek-V2-Lite-W8A8
 export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
 export RECIPE_CI_INTERFACE="<local_interface>"
 export LWS_WORKER_INDEX=0
@@ -80,7 +79,6 @@ Decode 机器作为 `node1` 执行：
 
 ```bash
 export RECIPE_CI_PLAN=configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml
-export RECIPE_CI_MODEL_PATH=/models/DeepSeek-V2-Lite-W8A8
 export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
 export RECIPE_CI_INTERFACE="<local_interface>"
 export LWS_WORKER_INDEX=1
@@ -108,23 +106,17 @@ IP 补充 `NO_PROXY`。
 └── node1/service.log
 ```
 
-## 可选 AISBench 阶段
+## AISBench 阶段
 
-默认只运行 completion smoke check。确认 AISBench 及 GSM8K 数据集已按
-`docs/MULTI_NODE_RECIPE_CI.md` 安装后，可在 Prefill 节点设置：
-
-```bash
-export RECIPE_CI_EVALUATION=accuracy  # 或 performance/all
-```
+plan 中声明的 completion、accuracy 和 performance 会全部执行。运行前应按
+`docs/MULTI_NODE_RECIPE_CI.md` 安装 AISBench。这个轻量 plan 自带 8 条离线 GSM8K
+格式样本，evaluation 会把它链接到 AISBench 的标准数据目录，不再运行时下载数据集。
 
 plan 内的 `aisbench/models/vllm_api_general_chat.py` 和 `vllm_api_stream_chat.py` 是
-Recipe 转换产物，分别供精度和性能评测使用。它们会读取当前 endpoint、模型路径和
-served model，无需修改 AISBench 安装目录。模型配置名可分别通过
+Recipe 转换产物，分别供精度和性能评测使用。evaluation 会根据当前 endpoint、模型路径和
+served model 将占位符渲染到 artifact 目录，无需修改 AISBench 安装目录。模型配置名可分别通过
 `RECIPE_AISBENCH_ACCURACY_MODEL_CONFIG` 和
 `RECIPE_AISBENCH_PERFORMANCE_MODEL_CONFIG` 覆盖；样本数可通过
 `RECIPE_AISBENCH_ACCURACY_NUM_PROMPTS` 和
 `RECIPE_AISBENCH_PERFORMANCE_NUM_PROMPTS` 调整。评测命令输出和 AISBench 产物都会
 写到该节点的 `accuracy/` 或 `performance/` artifact 目录。
-
-若评测可能超过默认的一小时运行超时，需要在 Decode 节点设置足够大的
-`RECIPE_CI_RUN_TIMEOUT_SECONDS`；这个值只约束等待 leader 最终结果的节点，不写入 plan。

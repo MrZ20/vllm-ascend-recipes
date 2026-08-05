@@ -22,7 +22,10 @@ from scripts.recipe_ci.plan import PlanError, load_hosts, load_plan  # noqa: E40
 
 EXAMPLE = ROOT / "configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c"
 GENERIC_DP_EXAMPLE = ROOT / "configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c"
-DEEPSEEK_V4_EXAMPLE = ROOT / "configs/recipe_ci/plans/deepseek-v4-flash-a3-pd"
+DEEPSEEK_V4_EXAMPLE = (
+    ROOT / "configs/recipe_ci/plans/deepseek-v4-flash-a2-pd-reduced"
+)
+QWEN35_EXAMPLE = ROOT / "configs/recipe_ci/plans/qwen3.5-27b-a2-pd-reduced"
 
 
 def free_port() -> int:
@@ -83,7 +86,12 @@ class PlanTests(unittest.TestCase):
         )
 
     def test_examples_keep_aisbench_model_config_in_the_plan(self) -> None:
-        for example in (EXAMPLE, GENERIC_DP_EXAMPLE):
+        for example in (
+            EXAMPLE,
+            GENERIC_DP_EXAMPLE,
+            DEEPSEEK_V4_EXAMPLE,
+            QWEN35_EXAMPLE,
+        ):
             accuracy_config = example / "aisbench/models/vllm_api_general_chat.py"
             performance_config = example / "aisbench/models/vllm_api_stream_chat.py"
             accuracy_script = (example / "evaluations/accuracy.sh").read_text(
@@ -99,6 +107,34 @@ class PlanTests(unittest.TestCase):
             self.assertIn("vllm_api_general_chat", accuracy_script)
             self.assertIn("$RECIPE_PLAN_DIR/aisbench", performance_script)
             self.assertIn("vllm_api_stream_chat", performance_script)
+            for config in (accuracy_config, performance_config):
+                text = config.read_text(encoding="utf-8")
+                self.assertNotIn("import os", text)
+                self.assertIn("path=__RECIPE_MODEL_PATH__", text)
+                self.assertIn("host_port=__RECIPE_ENDPOINT_PORT__", text)
+            self.assertIn("render-model-config", accuracy_script)
+            self.assertIn("render-model-config", performance_script)
+
+    def test_lightweight_plan_carries_an_offline_gsm8k_fixture(self) -> None:
+        dataset = EXAMPLE / "aisbench/datasets/gsm8k"
+        train_rows = [
+            json.loads(line)
+            for line in (dataset / "train.jsonl").read_text().splitlines()
+        ]
+        test_rows = [
+            json.loads(line)
+            for line in (dataset / "test.jsonl").read_text().splitlines()
+        ]
+
+        self.assertGreaterEqual(len(train_rows), 1)
+        self.assertEqual(len(test_rows), 8)
+        for row in [*train_rows, *test_rows]:
+            self.assertEqual(set(row), {"question", "answer"})
+            self.assertIn("#### ", row["answer"])
+
+        for script_name in ("accuracy.sh", "performance.sh"):
+            script = (EXAMPLE / "evaluations" / script_name).read_text()
+            self.assertIn("prepare_gsm8k.sh", script)
 
     def test_hosts_must_match_plan_nodes(self) -> None:
         plan = load_plan(EXAMPLE / "plan.yaml")
@@ -162,7 +198,7 @@ class PlanTests(unittest.TestCase):
 
         self.assertEqual(result.stdout.strip(), "5")
 
-    def test_deepseek_v4_plan_matches_the_two_node_a3_recipe_topology(self) -> None:
+    def test_deepseek_v4_plan_is_an_explicit_two_node_a2_reduced_topology(self) -> None:
         plan = load_plan(DEEPSEEK_V4_EXAMPLE / "plan.yaml")
         prefill_run = (DEEPSEEK_V4_EXAMPLE / plan.nodes[0].launch).read_text(
             encoding="utf-8"
@@ -182,21 +218,66 @@ class PlanTests(unittest.TestCase):
 
         self.assertEqual([node.id for node in plan.nodes], ["node0", "node1"])
         self.assertEqual([node.role for node in plan.nodes], ["prefill", "decode"])
-        self.assertEqual([node.readiness.count for node in plan.nodes], [4, 16])
-        for argument in ("--dp-size 4", "--tp-size 4", "--dp-size-local 4"):
+        self.assertEqual(plan.name, "deepseek-v4-flash-a2-pd-reduced")
+        self.assertEqual(
+            plan.model.cache_path,
+            "vllm-ascend/DeepSeek-V4-Flash-w8a8-mtp",
+        )
+        self.assertEqual([node.readiness.count for node in plan.nodes], [8, 8])
+        for argument in ("--dp-size 8", "--tp-size 1", "--dp-size-local 8"):
             self.assertIn(argument, prefill_run)
-        for argument in ("--dp-size 16", "--tp-size 1", "--dp-size-local 16"):
+        for argument in ("--dp-size 8", "--tp-size 1", "--dp-size-local 8"):
             self.assertIn(argument, decode_run)
         self.assertIn('"kv_role": "kv_producer"', prefill_template)
         self.assertIn('"kv_port": "30000"', prefill_template)
         self.assertIn('"kv_role": "kv_consumer"', decode_template)
         self.assertIn('"kv_port": "30100"', decode_template)
+        self.assertIn('"prefill": {"dp_size": 8, "tp_size": 1}', prefill_template)
+        self.assertIn('"decode": {"dp_size": 8, "tp_size": 1}', decode_template)
+        self.assertEqual(gateway.count('"$RECIPE_NODE_0_IP"'), 8)
+        self.assertEqual(gateway.count('"$RECIPE_NODE_1_IP"'), 8)
+        self.assertNotIn("RECIPE_NODE_2_IP", gateway)
+
+    def test_qwen35_plan_keeps_tp2_and_scales_dp_to_four_on_a2(self) -> None:
+        plan = load_plan(QWEN35_EXAMPLE / "plan.yaml")
+        prefill_run = (QWEN35_EXAMPLE / plan.nodes[0].launch).read_text(
+            encoding="utf-8"
+        )
+        decode_run = (QWEN35_EXAMPLE / plan.nodes[1].launch).read_text(
+            encoding="utf-8"
+        )
+        prefill_template = (
+            QWEN35_EXAMPLE / "nodes/node0/run_dp_template.sh"
+        ).read_text(encoding="utf-8")
+        decode_template = (
+            QWEN35_EXAMPLE / "nodes/node1/run_dp_template.sh"
+        ).read_text(encoding="utf-8")
+        gateway = (QWEN35_EXAMPLE / "gateway/run.sh").read_text(encoding="utf-8")
+
+        self.assertEqual([node.id for node in plan.nodes], ["node0", "node1"])
+        self.assertEqual([node.role for node in plan.nodes], ["prefill", "decode"])
+        self.assertEqual([node.readiness.count for node in plan.nodes], [4, 4])
+        self.assertEqual(
+            plan.model.cache_path,
+            "Eco-Tech/Qwen3.5-27B-w8a8-mtp",
+        )
+        for launch in (prefill_run, decode_run):
+            self.assertIn("--dp-size 4", launch)
+            self.assertIn("--tp-size 2", launch)
+            self.assertIn("--dp-size-local 4", launch)
+        self.assertIn('"kv_role": "kv_producer"', prefill_template)
+        self.assertIn('"kv_role": "kv_consumer"', decode_template)
+        for template in (prefill_template, decode_template):
+            self.assertIn('"prefill": {"dp_size": 4, "tp_size": 2}', template)
+            self.assertIn('"decode": {"dp_size": 4, "tp_size": 2}', template)
+            self.assertIn('"method":"qwen3_5_mtp"', template)
         self.assertEqual(gateway.count('"$RECIPE_NODE_0_IP"'), 4)
-        self.assertEqual(gateway.count('"$RECIPE_NODE_1_IP"'), 16)
+        self.assertEqual(gateway.count('"$RECIPE_NODE_1_IP"'), 4)
+        self.assertNotIn("RECIPE_NODE_2_IP", gateway)
 
 
 class LocalRunnerTests(unittest.TestCase):
-    def test_two_nodes_complete_gateway_check_and_accuracy_stage(self) -> None:
+    def test_two_nodes_run_every_check_and_evaluation_declared_by_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             plan_dir = Path(directory)
             control_port = free_port()
@@ -212,7 +293,6 @@ class LocalRunnerTests(unittest.TestCase):
             common_environment.update(
                 {
                     "RECIPE_CI_PLAN": str(plan_dir / "plan.yaml"),
-                    "RECIPE_CI_MODEL_PATH": "fake/model",
                     "RECIPE_CI_CLUSTER_IPS": "127.0.0.1,127.0.0.1",
                     "RECIPE_CI_INTERFACE": "lo",
                     "VLLM_ASCEND_ROOT": str(plan_dir / "vllm-ascend"),
@@ -220,7 +300,6 @@ class LocalRunnerTests(unittest.TestCase):
                     "RECIPE_CI_STARTUP_TIMEOUT_SECONDS": "20",
                     "RECIPE_CI_RUN_TIMEOUT_SECONDS": "20",
                     "RECIPE_CI_ARTIFACT_ROOT": str(artifact_root),
-                    "RECIPE_CI_EVALUATION": "accuracy",
                 }
             )
             leader_environment = common_environment | {"LWS_WORKER_INDEX": "0"}
@@ -281,6 +360,12 @@ class LocalRunnerTests(unittest.TestCase):
                     "accuracy"
                 ],
                 1.0,
+            )
+            self.assertEqual(
+                final_result["evaluations"]["performance"]["performance"][
+                    "metrics"
+                ]["request_per_second"],
+                2.0,
             )
             self.assertEqual(leader_result["status"], "passed")
             self.assertEqual(worker_result["status"], "passed")
@@ -438,12 +523,23 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
             "\"metrics\": {\"accuracy\": 1.0}}' > \"$RECIPE_STEP_RESULT_FILE\"\n",
             encoding="utf-8",
         )
+        (plan_dir / "evaluations/performance.sh").write_text(
+            "printf '%s\\n' '{\"status\": \"passed\", "
+            "\"type\": \"performance\", \"metrics\": "
+            "{\"request_per_second\": 2.0}}' > \"$RECIPE_STEP_RESULT_FILE\"\n",
+            encoding="utf-8",
+        )
 
         plan_data = {
             "api_version": "recipe-ci/v1",
             "kind": "MultiNodePlan",
             "metadata": {"name": "local-runner-test"},
-            "model": {"id": "fake/model", "served_name": "fake"},
+            "model": {
+                "id": "fake/model",
+                "cache_path": "fake/model",
+                "served_name": "fake",
+            },
+            "resources": {"npu_per_node": 1},
             "nodes": [
                 {
                     "id": "node0",
@@ -469,7 +565,14 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
                         "script": "evaluations/accuracy.sh",
                         "timeout_seconds": 5,
                     }
-                ]
+                ],
+                "performance": [
+                    {
+                        "id": "performance",
+                        "script": "evaluations/performance.sh",
+                        "timeout_seconds": 5,
+                    }
+                ],
             },
         }
         (plan_dir / "plan.yaml").write_text(

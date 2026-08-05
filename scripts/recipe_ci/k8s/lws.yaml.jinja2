@@ -11,29 +11,63 @@ spec:
     leaderTemplate:
       metadata:
         labels:
+          recipe-ci-run: {{ lws_name }}
           role: leader
       spec:
-        terminationGracePeriodSeconds: 120
-        tolerations:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        nodeSelector: &recipe-ci-node-selector
+          node.kubernetes.io/npu.chip.name: 910B4
+        # run.sh already stops vLLM and copies plogs before writing the status
+        # file watched by the controller. Keep a short window for cancellation.
+        terminationGracePeriodSeconds: 30
+        tolerations: &recipe-ci-tolerations
           - key: dedicated
             operator: Equal
             value: night
             effect: NoSchedule
+        affinity: &recipe-ci-affinity
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    recipe-ci-run: {{ lws_name }}
+                topologyKey: kubernetes.io/hostname
         containers:
           - name: recipe-ci-leader
             image: {{ image }}
-            imagePullPolicy: Always
+            imagePullPolicy: IfNotPresent
             workingDir: {{ run_root }}/source
-            command: [bash, {{ run_root }}/source/scripts/recipe_ci/run.sh]
+            command: &recipe-ci-command
+              - bash
+              - -c
+              - |
+                set +e
+                bash {{ run_root }}/source/scripts/recipe_ci/run.sh
+                status=$?
+                status_file={{ run_root }}/pod-status/node${LWS_WORKER_INDEX}.exit
+                printf '%s\n' "$status" > "$status_file.tmp"
+                mv "$status_file.tmp" "$status_file"
+                exec sleep infinity
             env: &recipe-ci-env
               - name: RECIPE_CI_PLAN
                 value: {{ plan }}
-              - name: RECIPE_CI_MODEL_PATH
-                value: {{ model_path }}
-              - name: RECIPE_CI_EVALUATION
-                value: {{ evaluation }}
               - name: RECIPE_CI_INSTALL_AISBENCH
                 value: "true"
+              # Cache the pinned source on the shared PVC. Each fresh runtime
+              # image can reinstall the command without cloning from GitHub.
+              - name: AIS_BENCH_ROOT
+                value: /root/.cache/recipe-ci/tools/aisbench/benchmark
+              - name: RECIPE_AISBENCH_ROOT
+                value: /root/.cache/recipe-ci/tools/aisbench/benchmark
+              - name: RECIPE_CI_INSTALL_MOONCAKE
+                value: "true"
+              # Use the cluster cache for runtime installs. /root/.cache/pip is
+              # also persisted by the shared PVC for later Recipe CI runs.
+              - name: PIP_INDEX_URL
+                value: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+              - name: PIP_TRUSTED_HOST
+                value: cache-service.nginx-pypi-cache.svc.cluster.local
               - name: RECIPE_CI_STARTUP_TIMEOUT_SECONDS
                 value: "{{ startup_timeout_seconds }}"
               - name: RECIPE_CI_RUN_TIMEOUT_SECONDS
@@ -44,18 +78,10 @@ spec:
                 value: {{ run_root }}/artifacts
               - name: RECIPE_CI_PLOG_ROOT
                 value: {{ run_root }}/plogs
-              - name: RECIPE_CI_INTERFACE
-                value: eth0
-              - name: RECIPE_CI_VISIBLE_DEVICES
-                value: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
               - name: RECIPE_CI_IMAGE
                 value: {{ image }}
               - name: GITHUB_SHA
                 value: {{ commit }}
-              - name: RECIPE_AISBENCH_ACCURACY_DATASET_DIR
-                value: {{ aisbench_dataset_dir }}
-              - name: RECIPE_AISBENCH_PERFORMANCE_DATASET_DIR
-                value: {{ aisbench_dataset_dir }}
               - name: VLLM_LOGGING_LEVEL
                 value: ERROR
               - name: VLLM_USE_MODELSCOPE
@@ -68,13 +94,16 @@ spec:
                 value: "0"
             resources: &recipe-ci-resources
               requests:
-                huawei.com/ascend-1980: 16
-                cpu: 125
-                ephemeral-storage: 100Gi
+                huawei.com/ascend-1980: {{ npu_per_node }}
+                cpu: 8
+                memory: 128Gi
+                ephemeral-storage: 20Gi
               limits:
-                huawei.com/ascend-1980: 16
-                memory: 512Gi
-                ephemeral-storage: 100Gi
+                huawei.com/ascend-1980: {{ npu_per_node }}
+                memory: 128Gi
+                ephemeral-storage: 20Gi
+            securityContext: &recipe-ci-security-context
+              privileged: true
             ports:
               - name: coordinator
                 containerPort: 29599
@@ -84,8 +113,10 @@ spec:
               - name: shared-volume
                 mountPath: /root/.cache
               - name: driver-tools
-                mountPath: /usr/local/Ascend/driver/tools
-              - name: dshm
+                mountPath: /usr/local/Ascend/driver
+              - name: worklogs
+                mountPath: /root/ascend/log
+              - name: shm-volume
                 mountPath: /dev/shm
         volumes: &recipe-ci-volumes
           - name: shared-volume
@@ -93,44 +124,33 @@ spec:
               claimName: {{ pvc_name }}
           - name: driver-tools
             hostPath:
-              path: /usr/local/Ascend/driver/tools
-          - name: dshm
+              path: /usr/local/Ascend/driver
+          - name: worklogs
+            emptyDir: {}
+          - name: shm-volume
             emptyDir:
               medium: Memory
-              sizeLimit: 512Gi
+              sizeLimit: 16Gi
     workerTemplate:
+      metadata:
+        labels:
+          recipe-ci-run: {{ lws_name }}
+          role: worker
       spec:
-        terminationGracePeriodSeconds: 120
-        tolerations:
-          - key: dedicated
-            operator: Equal
-            value: night
-            effect: NoSchedule
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        nodeSelector: *recipe-ci-node-selector
+        terminationGracePeriodSeconds: 30
+        tolerations: *recipe-ci-tolerations
+        affinity: *recipe-ci-affinity
         containers:
           - name: recipe-ci-worker
             image: {{ image }}
-            imagePullPolicy: Always
+            imagePullPolicy: IfNotPresent
             workingDir: {{ run_root }}/source
-            command: [bash, {{ run_root }}/source/scripts/recipe_ci/run.sh]
+            command: *recipe-ci-command
             env: *recipe-ci-env
             resources: *recipe-ci-resources
+            securityContext: *recipe-ci-security-context
             volumeMounts: *recipe-ci-volume-mounts
         volumes: *recipe-ci-volumes
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ lws_name }}-leader
-  namespace: {{ namespace }}
-spec:
-  selector:
-    leaderworkerset.sigs.k8s.io/name: {{ lws_name }}
-    role: leader
-  ports:
-    - name: coordinator
-      port: 29599
-      targetPort: 29599
-    - name: gateway
-      port: 38085
-      targetPort: 38085
-  type: ClusterIP

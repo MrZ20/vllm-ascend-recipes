@@ -6,7 +6,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -24,7 +24,13 @@ class PlanError(ValueError):
 @dataclass(frozen=True)
 class Model:
     id: str
+    cache_path: str
     served_name: str
+
+
+@dataclass(frozen=True)
+class Resources:
+    npu_per_node: int
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,7 @@ class Plan:
     path: Path
     name: str
     model: Model
+    resources: Resources
     nodes: list[Node]
     gateway: Gateway | None
     checks: list[ScriptStep]
@@ -124,6 +131,13 @@ def _slug(value: Any, field: str) -> str:
             f"{field} must match [A-Za-z0-9][A-Za-z0-9._-]*, got {slug}"
         )
     return slug
+
+
+def _relative_path(value: Any, field: str) -> str:
+    relative_path = PurePosixPath(_string(value, field))
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise PlanError(f"{field} must be a relative path, got {relative_path}")
+    return relative_path.as_posix()
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -220,6 +234,7 @@ def load_plan(path: Path) -> Plan:
             "kind",
             "metadata",
             "model",
+            "resources",
             "nodes",
             "gateway",
             "checks",
@@ -235,7 +250,9 @@ def load_plan(path: Path) -> Plan:
     metadata = _mapping(raw.get("metadata"), "metadata")
     _check_fields(metadata, {"name"}, "metadata")
     model_raw = _mapping(raw.get("model"), "model")
-    _check_fields(model_raw, {"id", "served_name"}, "model")
+    _check_fields(model_raw, {"id", "cache_path", "served_name"}, "model")
+    resources_raw = _mapping(raw.get("resources"), "resources")
+    _check_fields(resources_raw, {"npu_per_node"}, "resources")
     nodes_raw = raw.get("nodes")
     if not isinstance(nodes_raw, list) or len(nodes_raw) < 2:
         raise PlanError("nodes must contain at least two entries")
@@ -340,7 +357,15 @@ def load_plan(path: Path) -> Plan:
         name=_slug(metadata.get("name"), "metadata.name"),
         model=Model(
             id=_string(model_raw.get("id"), "model.id"),
+            cache_path=_relative_path(
+                model_raw.get("cache_path"), "model.cache_path"
+            ),
             served_name=_string(model_raw.get("served_name"), "model.served_name"),
+        ),
+        resources=Resources(
+            npu_per_node=_positive_int(
+                resources_raw.get("npu_per_node"), "resources.npu_per_node"
+            )
         ),
         nodes=nodes,
         gateway=gateway,
@@ -405,6 +430,7 @@ def format_topology_summary(
         f"Leader: {plan.leader.id}",
         f"Model: {plan.model.id}",
         f"Served name: {plan.model.served_name}",
+        f"NPUs per node: {plan.resources.npu_per_node}",
         "",
         "Nodes:",
     ]

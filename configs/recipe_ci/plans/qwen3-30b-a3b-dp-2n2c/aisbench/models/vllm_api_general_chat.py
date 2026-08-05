@@ -1,29 +1,27 @@
-import os
-
 from ais_bench.benchmark.models import VLLMCustomAPIChat
 from ais_bench.benchmark.utils.postprocess.model_postprocessors import (
     extract_non_reasoning_content,
 )
 
 
-# Accuracy request configuration generated from the Recipe. Values that are only
-# known at runtime, such as the API address, are injected by the Runner.
+# Accuracy request configuration generated from the Recipe. The evaluation
+# renders values supplied by the Runner before AISBench loads this file.
 models = [
     dict(
         attr="service",
         type=VLLMCustomAPIChat,
         abbr="vllm-api-general-chat",
-        path=os.environ["RECIPE_MODEL_PATH"],
-        model=os.environ["RECIPE_SERVED_MODEL_NAME"],
+        path=__RECIPE_MODEL_PATH__,
+        model=__RECIPE_SERVED_MODEL_NAME__,
         stream=False,
         request_rate=0,
         use_timestamp=False,
         retry=2,
         api_key="",
-        host_ip=os.environ["RECIPE_ENDPOINT_HOST"],
-        host_port=int(os.environ["RECIPE_ENDPOINT_PORT"]),
+        host_ip=__RECIPE_ENDPOINT_HOST__,
+        host_port=__RECIPE_ENDPOINT_PORT__,
         url="",
-        max_out_len=int(os.environ.get("RECIPE_AISBENCH_MAX_OUT_LEN", "512")),
+        max_out_len=__RECIPE_AISBENCH_MAX_OUT_LEN__,
         batch_size=1,
         trust_remote_code=False,
         generation_kwargs=dict(

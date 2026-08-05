@@ -27,12 +27,11 @@ if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
 fi
 
 if [[ "${RECIPE_CI_VALIDATE_ONLY:-false}" == "true" ]]; then
-    exec python3 "$SCRIPT_DIR/runner.py" \
+    exec python3 -u "$SCRIPT_DIR/runner.py" \
         --plan "$RECIPE_CI_PLAN" \
         --validate-only
 fi
 
-: "${RECIPE_CI_MODEL_PATH:?RECIPE_CI_MODEL_PATH is required}"
 : "${LWS_WORKER_INDEX:?LWS_WORKER_INDEX is required}"
 if [[ ! "$LWS_WORKER_INDEX" =~ ^[0-9]+$ ]]; then
     echo "LWS_WORKER_INDEX must be a non-negative integer" >&2
@@ -64,13 +63,15 @@ hosts_file="/tmp/recipe-ci-hosts-${LWS_WORKER_INDEX}.yaml"
 resolve_ipv4() {
     local dns=$1
     local address=""
-    for _ in $(seq 1 240); do
-        address=$(getent ahostsv4 "$dns" | awk 'NR == 1 {print $1}')
+    local deadline=$((SECONDS + ${RECIPE_CI_STARTUP_TIMEOUT_SECONDS:-300}))
+    echo "Waiting for cluster DNS: $dns" >&2
+    while ((SECONDS < deadline)); do
+        address=$(getent ahostsv4 "$dns" 2>/dev/null | awk 'NR == 1 {print $1}' || true)
         if [[ -n "$address" ]]; then
             printf '%s\n' "$address"
             return 0
         fi
-        sleep 0.5
+        sleep 1
     done
     echo "Unable to resolve cluster DNS: $dns" >&2
     return 1
@@ -118,14 +119,23 @@ export RECIPE_CI_CLUSTER_IPS
 if command -v npu-smi >/dev/null 2>&1; then
     npu-smi info
 fi
-if [[ -z "${RECIPE_CI_VISIBLE_DEVICES:-}" && -n "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
-    export RECIPE_CI_VISIBLE_DEVICES=$ASCEND_RT_VISIBLE_DEVICES
+if [[ -z "${RECIPE_CI_VISIBLE_DEVICES:-}" ]]; then
+    if [[ -n "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
+        export RECIPE_CI_VISIBLE_DEVICES=$ASCEND_RT_VISIBLE_DEVICES
+    elif [[ -n "${ASCEND_VISIBLE_DEVICES:-}" ]]; then
+        export RECIPE_CI_VISIBLE_DEVICES=$ASCEND_VISIBLE_DEVICES
+    fi
 fi
 echo "Recipe CI node: index=$LWS_WORKER_INDEX id=$node_id ip=${cluster_ips[$LWS_WORKER_INDEX]}"
 echo "Recipe CI visible devices: ${RECIPE_CI_VISIBLE_DEVICES:-container default}"
 
-evaluation=${RECIPE_CI_EVALUATION:-none}
-if [[ "${RECIPE_CI_INSTALL_AISBENCH:-false}" == "true" && "$evaluation" != "none" && "$node_id" == "node0" ]]; then
+if [[ "${RECIPE_CI_INSTALL_MOONCAKE:-false}" == "true" ]]; then
+    mooncake_lib_dir=$("$SCRIPT_DIR/install_mooncake.sh")
+    export LD_LIBRARY_PATH="${mooncake_lib_dir}:${LD_LIBRARY_PATH:-}"
+    echo "Mooncake library path: ${mooncake_lib_dir}"
+fi
+
+if [[ "${RECIPE_CI_INSTALL_AISBENCH:-false}" == "true" && "$node_id" == "node0" ]]; then
     if ! command -v "${RECIPE_AISBENCH_BIN:-ais_bench}" >/dev/null 2>&1; then
         "$SCRIPT_DIR/install_aisbench.sh"
     fi
@@ -156,16 +166,14 @@ forward_signal() {
 trap 'forward_signal TERM' TERM
 trap 'forward_signal INT' INT
 
-python3 "$SCRIPT_DIR/runner.py" \
+python3 -u "$SCRIPT_DIR/runner.py" \
     --plan "$RECIPE_CI_PLAN" \
     --hosts "$hosts_file" \
     --node-id "$node_id" \
-    --model-path "$RECIPE_CI_MODEL_PATH" \
     --vllm-ascend-root "${VLLM_ASCEND_ROOT:-/vllm-workspace/vllm-ascend}" \
     --control-port "${RECIPE_CI_CONTROL_PORT:-29599}" \
     --startup-timeout-seconds "${RECIPE_CI_STARTUP_TIMEOUT_SECONDS:-3600}" \
     --run-timeout-seconds "${RECIPE_CI_RUN_TIMEOUT_SECONDS:-14400}" \
-    --evaluation "$evaluation" \
     --artifact-root "$artifact_root" &
 runner_pid=$!
 

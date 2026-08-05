@@ -10,7 +10,7 @@ node1 (headless): headless DP rank 2、3，TP1，共 2 卡
                          ↓
 node0:7100 作为唯一服务入口
                          ↓
-completion curl 和可选 AISBench
+completion curl 和 plan 中声明的 AISBench
 ```
 
 它直接消费手工 `plan.yaml` 中间态，不依赖 Recipe 转换、Kubernetes 或共享文件系统。
@@ -31,7 +31,7 @@ docker run --rm -it \
   --network host \
   --ipc host \
   --shm-size 64g \
-  -v /path/on/host/Qwen3-30B-A3B:/models/Qwen3-30B-A3B:ro \
+  -v /path/on/host/Qwen3-30B-A3B:/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B:ro \
   quay.io/ascend/vllm-ascend:v0.22.1rc1 \
   bash
 ```
@@ -63,7 +63,6 @@ API 机器作为 `node0` 执行：
 
 ```bash
 export RECIPE_CI_PLAN=configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml
-export RECIPE_CI_MODEL_PATH=/models/Qwen3-30B-A3B
 export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
 export RECIPE_CI_INTERFACE="<local_interface>"
 export LWS_WORKER_INDEX=0
@@ -75,7 +74,6 @@ Headless 机器作为 `node1` 执行：
 
 ```bash
 export RECIPE_CI_PLAN=configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml
-export RECIPE_CI_MODEL_PATH=/models/Qwen3-30B-A3B
 export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
 export RECIPE_CI_INTERFACE="<local_interface>"
 export LWS_WORKER_INDEX=1
@@ -100,10 +98,10 @@ rank 已连接。每节点直接消费 `ASCEND_RT_VISIBLE_DEVICES` 中的两张�
 └── node1/service.log
 ```
 
-默认不运行评测。确认 AISBench 及 GSM8K 数据集已按 `docs/MULTI_NODE_RECIPE_CI.md`
-安装后，可在 `node0` 设置 `RECIPE_CI_EVALUATION=accuracy`、`performance` 或 `all`。plan 内的
+plan 中声明的 check、accuracy 和 performance 都会执行，因此应先按
+`docs/MULTI_NODE_RECIPE_CI.md` 安装 AISBench 和 GSM8K 数据集。plan 内的
 `vllm_api_general_chat.py` 和 `vllm_api_stream_chat.py` 分别供精度和性能评测使用，
-并自动读取当前 endpoint 和 served model；样本数可通过
+evaluation 会用当前 endpoint 和 served model 渲染后再执行；样本数可通过
 `RECIPE_AISBENCH_ACCURACY_NUM_PROMPTS` 和
 `RECIPE_AISBENCH_PERFORMANCE_NUM_PROMPTS` 调整。Runner 不会清理任何代理环境变量，
 只会把节点 IP 加入 `NO_PROXY`。

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from scripts.recipe_ci.aisbench import (  # noqa: E402
     accuracy_score,
     performance_metrics,
     preflight,
+    render_model_config,
 )
 
 
@@ -50,6 +52,37 @@ class AisbenchResultTests(unittest.TestCase):
                 preflight(args)
 
             self.assertTrue(artifact.is_dir())
+
+    def test_model_config_template_is_rendered_with_runtime_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            template = root / "model.py"
+            output = root / "rendered/model.py"
+            template.write_text(
+                "models = [dict("
+                "path=__RECIPE_MODEL_PATH__, "
+                "model=__RECIPE_SERVED_MODEL_NAME__, "
+                "host_ip=__RECIPE_ENDPOINT_HOST__, "
+                "host_port=__RECIPE_ENDPOINT_PORT__, "
+                "max_out_len=__RECIPE_AISBENCH_MAX_OUT_LEN__)]\n",
+                encoding="utf-8",
+            )
+            environment = {
+                "RECIPE_MODEL_PATH": "/models/fake",
+                "RECIPE_SERVED_MODEL_NAME": "fake",
+                "RECIPE_ENDPOINT_HOST": "10.0.0.8",
+                "RECIPE_ENDPOINT_PORT": "38085",
+            }
+
+            with mock.patch.dict(os.environ, environment, clear=False):
+                render_model_config(template, output)
+
+            model = runpy.run_path(str(output))["models"][0]
+            self.assertEqual(model["path"], "/models/fake")
+            self.assertEqual(model["model"], "fake")
+            self.assertEqual(model["host_ip"], "10.0.0.8")
+            self.assertEqual(model["host_port"], 38085)
+            self.assertEqual(model["max_out_len"], 512)
 
     def test_accuracy_summary_is_translated_and_gated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

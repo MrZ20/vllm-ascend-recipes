@@ -424,6 +424,28 @@ class CoordinatorClient:
     def mark_cleaned(self, node_id: str, timeout: int = 5) -> None:
         self._post(f"/nodes/{node_id}/cleaned", {}, timeout)
 
+    def wait_available(
+        self,
+        timeout: int,
+        check_processes: Callable[[], None],
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            check_processes()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CoordinatorError(
+                    "timed out waiting for the coordinator",
+                    code="coordinator_unreachable",
+                )
+            try:
+                self._get_state(min(remaining, self.unreachable_timeout))
+                return
+            except CoordinatorError as error:
+                if error.code != "coordinator_unreachable":
+                    raise
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+
     def wait_terminal(
         self,
         timeout: int,

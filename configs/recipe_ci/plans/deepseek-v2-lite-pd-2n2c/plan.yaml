@@ -6,7 +6,11 @@ metadata:
 
 model:
   id: vllm-ascend/DeepSeek-V2-Lite-W8A8
+  cache_path: vllm-ascend/DeepSeek-V2-Lite-W8A8
   served_name: deepseek-v2-lite
+
+resources:
+  npu_per_node: 2
 
 nodes:
   - id: node0
