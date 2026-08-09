@@ -23,7 +23,6 @@ from scripts.recipe_ci.process import (  # noqa: E402
 from scripts.recipe_ci.result import (  # noqa: E402
     RunFailure,
     build_final_result,
-    utc_now,
     write_json_atomic,
 )
 
@@ -68,13 +67,40 @@ class ResultTests(unittest.TestCase):
         result = build_final_result(
             plan="fixture",
             status="failed",
-            started_at=utc_now(),
-            primary_failure=primary,
+            failure=primary,
             cleanup_errors=[cleanup],
         )
 
-        self.assertEqual(result["failure"]["category"], "check_failed")
+        self.assertEqual(
+            result["failure"],
+            {"category": "check_failed", "message": "request failed"},
+        )
         self.assertEqual(result["cleanup_errors"][0]["category"], "cleanup_failed")
+        self.assertEqual(
+            set(result),
+            {
+                "schema_version",
+                "plan",
+                "status",
+                "failure",
+                "cleanup_errors",
+                "nodes",
+                "checks",
+                "evaluations",
+            },
+        )
+
+    def test_cleanup_failure_becomes_primary_only_after_success(self) -> None:
+        cleanup = RunFailure(category="cleanup_failed", message="group survived")
+
+        result = build_final_result(
+            plan="fixture",
+            status="passed",
+            cleanup_errors=[cleanup],
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure"], result["cleanup_errors"][0])
 
     def test_atomic_json_replaces_an_existing_complete_document(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

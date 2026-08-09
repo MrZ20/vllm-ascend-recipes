@@ -9,7 +9,7 @@ dp_address=$5
 dp_rpc_port=$6
 tp_size=$7
 
-IFS=',' read -r -a available_devices <<< "${RECIPE_CI_VISIBLE_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:?set ASCEND_RT_VISIBLE_DEVICES}}"
+IFS=',' read -r -a available_devices <<< "$RECIPE_CI_VISIBLE_DEVICES"
 IFS=',' read -r -a logical_indexes <<< "$logical_devices"
 selected_devices=()
 for index in "${logical_indexes[@]}"; do

@@ -22,12 +22,13 @@ configs/recipe_ci/plans/<case>/
 └── aisbench/models/
 
 scripts/recipe_ci/
-├── plan.py          # 严格 schema 与 hosts 校验
-├── coordinator.py   # 轻量 HTTP 状态机
-├── process.py       # 进程组、信号、日志尾部与清理
-├── result.py        # 结构化结果与原子 JSON
+├── plan.py          # v1 中间态与 hosts 校验
+├── coordinator.py   # 本地/LWS 共用的轻量 HTTP 协调
+├── process.py       # 进程组、信号与清理
+├── result.py        # 最小结果合同与原子 JSON
 ├── runner.py        # 线性节点生命周期
-├── aisbench.py      # AISBench preflight 与指标转换
+├── aisbench.py      # 固定 AISBench 版本的 preflight 与指标转换
+├── install_aisbench.sh  # CI 启动 LWS 前准备共享缓存
 ├── k8s/lws.yaml.jinja2  # N 个 plan 指定卡数的 A2 Pod 和共享卷
 └── run.sh           # 本地与 LWS 共用的唯一节点入口
 ```
@@ -95,9 +96,10 @@ LWS 自动注入 `LWS_WORKER_INDEX` 和 `LWS_LEADER_ADDRESS`；Device Plugin 注
 NPU 列表。`run.sh` 在未提供
 `RECIPE_CI_CLUSTER_IPS` 时等待所有 LWS Pod 注册 DNS，再生成相同的 IP 列表，避免
 leader 先于 worker 调度完成时提前退出。
-Workflow 还显式设置 `RECIPE_CI_INSTALL_AISBENCH=true`；本地可以预先执行
-`install_aisbench.sh` 或按需设置该变量。Runner 不再接受外部 evaluation 选择，plan 中
-声明的 accuracy 和 performance 步骤都会按顺序执行。
+Workflow 在启动 LWS 前准备 AISBench，并向 Pod 注入 `RECIPE_AISBENCH_ROOT` 和
+`RECIPE_AISBENCH_BIN`。本地模式使用已有安装时显式设置这两个变量；节点运行期间不会
+clone 或安装 AISBench。Runner 不接受外部 evaluation 选择，plan 中声明的 accuracy 和
+performance 步骤都会按顺序执行。
 
 本地镜像中可将 recipes 仓库与 vLLM Ascend 源码放在同级目录：
 
@@ -133,8 +135,6 @@ RECIPE_ARTIFACT_ROOT / RECIPE_NODE_ARTIFACT_DIR
 RECIPE_STEP_ARTIFACT_DIR / RECIPE_STEP_RESULT_FILE
 ```
 
-`RECIPE_ARTIFACT_DIR` 暂时作为 v1 兼容别名指向当前 stage 目录。
-
 ## 生命周期与失败保证
 
 ```text
@@ -163,9 +163,10 @@ check 和 evaluation 都在独立 process group 中运行。等待长步骤期�
 日志和存活验证，不使用 `pkill` 或 `killall`。第一个执行错误保存为 `primary_failure`，
 清理错误单独进入 `cleanup_errors`，不会覆盖原始原因。
 
-Coordinator 的运行状态是 `running/passed/failed/cancelled`，节点状态是
-`pending/ready/failed/cleaned`。相同请求幂等，terminal 不可改变。`terminal` 表示执行
-结果已确定；`cleaned` 表示该节点已经清理进程、关闭日志并写完本地结果，两者不能混用。
+Coordinator 的运行状态是 `running/passed/failed/cancelled`，节点执行状态是
+`pending/ready/passed/failed/cancelled`；`cleaned` 是独立集合，不会覆盖执行结果。
+相同请求幂等，terminal 不可改变。客户端只在等待 Leader coordinator 启动时轮询；普通
+状态请求失败立即终止，避免通用重试掩盖节点网络故障。
 
 leader 被 SIGINT/SIGTERM 时可先发布 `cancelled`。leader 被 SIGKILL、机器掉电或容器被
 强制删除时无法主动发布失败；worker 会在 coordinator 连续不可达超过有限 grace period
@@ -181,67 +182,64 @@ artifacts/<plan>/
 ├── node0/
 │   ├── service.log
 │   ├── gateway.log
-│   ├── coordinator.log
 │   ├── checks/
 │   ├── accuracy/
 │   ├── performance/
-│   ├── environment.json
 │   └── node-result.json
 ├── node1/
 └── result.json            # 仅 leader
 ```
 
-JSON 通过同目录临时文件、fsync 和原子 replace 写入。`environment.json` 只保存 Python、
-平台、明确允许的软件版本、镜像标识和 commit，不 dump 全部环境变量。leader 的
-`result.json` 只承诺包含 coordinator 可见的节点状态和 leader step 结果。本地运行时各
+JSON 通过同目录临时文件和原子 replace 写入。leader 的 `result.json` 只包含执行结论、
+首个失败、清理错误、coordinator 可见节点状态以及 leader step 结果。本地运行时各
 节点自行保留日志；K8s 模式中所有 Pod 直接写入共享 artifact 根目录，控制器再组成 bundle。
 
 ## AISBench
 
-vLLM Ascend CI 镜像可在 vLLM Ascend 源码目录的 `benchmark/` 安装固定
-tag。普通运行时镜像不一定包含它，可显式执行：
+固定运行镜像不包含 AISBench。CI controller 在启动 LWS 前显式执行：
 
 ```bash
 scripts/recipe_ci/install_aisbench.sh
 ```
 
-默认固定：
+脚本固定版本，并按 commit、Python 主次版本、架构和 constraints 摘要生成共享 PVC
+缓存键：
 
 ```text
 tag:    v3.1-20260609-master
 commit: 0da56eadb2ac85c31c2540f4f5b69af3ec5717a5
 ```
 
-目录已是正确 remote、commit、tracked-clean 且 `ais_bench -h` 成功时重复执行不会安装。
-版本不一致默认失败，只有显式 `--force-reinstall` 才替换。脚本尊重已有 pip 配置，不写死
-镜像源。可用 `AIS_BENCH_VENV` 安装到独立虚拟环境；这能避免本地长期环境被 AISBench
-依赖约束影响。K8s 模板使用集群 PyPI cache，且共享 PVC 会保留 `/root/.cache/pip`。
-安装脚本固定使用最后一个兼容 NumPy 1.x 的 OpenCV 版本，避免 pip 下载多个 30 MB 以上
-的 wheel 进行依赖回溯。
-
-轻量双节点 plan 自带 8 条 GSM8K 格式的离线 smoke 数据，并在运行时链接到 AISBench
-约定的位置：
-
 ```text
-/vllm-workspace/vllm-ascend/benchmark/ais_bench/datasets/gsm8k
+/root/.cache/recipe-ci/tools/aisbench/
+└── <commit>-py<major.minor>-<arch>-<constraints-hash>/
+    ├── source/
+    ├── venv/
+    └── READY
 ```
 
-因此这条 CI 不依赖共享 PVC 预置或在线下载完整 GSM8K。每个 plan 分别携带 accuracy 的
+缓存命中时只执行 `ais_bench -h` 校验；未命中时在临时目录安装，验证后在 per-key lock
+保护下原子发布。K8s 使用集群 PyPI cache。`run.sh` 只消费最终路径，不承担安装。
+
+轻量双节点 plan 自带 8 条 GSM8K 格式的离线 smoke 数据，并在每个 evaluation 的
+step artifact 下构造 AISBench 约定的相对路径：
+
+```text
+<step-artifact>/ais_bench/datasets/gsm8k
+```
+
+因此这条 CI 不依赖共享 PVC 预置或在线下载完整 GSM8K，也不会修改共享的 AISBench
+source/cache。每个 plan 分别携带 accuracy 的
 `vllm_api_general_chat.py` 和 performance 的
 `vllm_api_stream_chat.py`。evaluation 将其中少量运行时占位符渲染到当前 step 的 artifact
 目录，再交给 AISBench，避免修改上游安装目录或依赖 MMEngine 的 lazy-import 细节。
-正式运行前检查命令、`-h`、渲染后的模型配置、数据集目录、endpoint 环境和 artifact
-可写性。AISBench wrapper 从产物提取指标并写
+controller prepare step 统一执行一次 `ais_bench -h`；evaluation 只检查当前命令、模型
+配置和数据集路径并创建 step artifact。AISBench wrapper 从固定的 3.1 产物结构提取指标并写
 `RECIPE_STEP_RESULT_FILE`；Runner 不解析 AISBench 私有日志。
 
-默认少量样本是流程 smoke，只验证请求和产物。设置以下变量才启用 accuracy gate：
-
-```bash
-export RECIPE_AISBENCH_ACCURACY_BASELINE=80
-export RECIPE_AISBENCH_ACCURACY_ALLOWED_DROP=2
-```
-
-baseline 与 tolerance 使用 AISBench summary CSV 的原始 score 单位，不由 wrapper 归一化。
+当前手工中间态固定少量样本，属于流程 smoke。未来 Recipe 若声明 accuracy gate，转换器应
+把 baseline 和 tolerance 直接生成到 evaluation 命令中，不在最终中间态通过兼容环境变量
+覆盖。
 
 performance 结果至少包含 TTFT、TPOT、E2E latency、output token/s 和 request/s。
 
@@ -331,8 +329,12 @@ Plugin 注入的 `ASCEND_VISIBLE_DEVICES`，再交给 plan-local launcher 使用
 `vllm-ascend/DeepSeek-V2-Lite-W8A8`。模型路径不是凭据，因此不使用 Workflow input、
 Variable 或 Secret。CI 管理员只需配置真正敏感的
 `KUBECONFIG_B64` Secret。基础镜像必须包含 `/opt/vllm-ascend` 及 Mooncake runtime；recipes
-源码由 controller 暂存，不在 Pod 中联网 clone。镜像没有 AISBench 时，仅 node0 调用固定
-版本安装脚本；当前轻量 plan 的 GSM8K smoke 数据也随源码暂存。
+源码由 controller 暂存，不在 Pod 中联网 clone。AISBench 由 controller 在 LWS 启动前
+准备到共享 PVC，所有 Pod 使用同一固定路径；当前轻量 plan 的 GSM8K smoke 数据随源码暂存。
+
+artifact bundle 同时通过 `ascend-gha-runners/artifact/upload@v0.3` 上传 OBS，并通过
+`actions/upload-artifact` 上传 GitHub。self-hosted runner 到 GitHub Artifact Storage 的
+连通性并不稳定，因此保留两个后端；上传失败只写 warning，不覆盖模型测试结论。
 
 PR 使用集群 Kubeconfig 并执行 PR 中的脚本，因此只运行同仓库分支创建的 PR；fork PR 会跳过
 集群 job，避免向不受信任的 fork 暴露凭据。当前不接入 nightly 自动触发。

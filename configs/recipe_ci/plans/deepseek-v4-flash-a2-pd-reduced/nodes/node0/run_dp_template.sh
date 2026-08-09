@@ -11,7 +11,7 @@ tp_size=$7
 
 # launch_online_dp.py passes logical indexes such as 0,1,...,7. Map them to the
 # physical cards selected by the CI job through ASCEND_RT_VISIBLE_DEVICES.
-IFS=',' read -r -a available_devices <<< "${RECIPE_CI_VISIBLE_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:?set ASCEND_RT_VISIBLE_DEVICES}}"
+IFS=',' read -r -a available_devices <<< "$RECIPE_CI_VISIBLE_DEVICES"
 IFS=',' read -r -a logical_indexes <<< "$logical_devices"
 selected_devices=()
 for index in "${logical_indexes[@]}"; do

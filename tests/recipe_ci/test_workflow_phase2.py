@@ -61,6 +61,14 @@ class MultiNodeWorkflowTests(unittest.TestCase):
             set(value["on"]["workflow_call"]["secrets"]),
             {"KUBECONFIG_B64", "OBS_AK", "OBS_SK"},
         )
+        self.assertEqual(
+            value["on"]["workflow_call"]["secrets"]["OBS_AK"]["required"],
+            "false",
+        )
+        self.assertEqual(
+            value["on"]["workflow_call"]["secrets"]["OBS_SK"]["required"],
+            "false",
+        )
         self.assertEqual(set(value["jobs"]), {"recipe-ci"})
         self.assertIn("kubectl apply", text)
         self.assertIn("kubectl delete", text)
@@ -72,8 +80,16 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertIn("len(plan.nodes)", text)
         self.assertIn("plan.resources.npu_per_node", text)
         self.assertIn("python3 -m pip install pyyaml", text)
-        self.assertIn("import yaml", text)
-        self.assertIn("linux-aarch64-a2b4-0", text)
+        self.assertIn("- name: Prepare AISBench", text)
+        self.assertIn(
+            "scripts/recipe_ci/install_aisbench.sh --env-file", text
+        )
+        self.assertIn("RECIPE_AISBENCH_BIN", text)
+        self.assertLess(
+            text.index("- name: Prepare AISBench"),
+            text.index("- name: Render and launch LeaderWorkerSet"),
+        )
+        self.assertIn("linux-aarch64-a2b4-8", text)
         self.assertIn("vllm-ascend-vllm-ascend-recipes", text)
         self.assertIn("vllm-ascend-vllm-ascend-recipes-gy001", text)
         self.assertIn("STARTUP_TIMEOUT_SECONDS: 3600", text)
@@ -94,9 +110,9 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertIn('node_failed=true', text)
         self.assertIn('"$node_failed" == true || "$all_finished" == true', text)
         self.assertIn("id: run_recipe", text)
-        self.assertIn("Recipe CI failure diagnostics", text)
-        self.assertIn("failure-diagnostics.log", text)
-        self.assertIn("::error title=Recipe CI failure diagnostics", text)
+        self.assertIn("--for=create --timeout=20m", text)
+        self.assertIn("--for=condition=Ready --timeout=20m", text)
+        self.assertNotIn("failure-diagnostics.log", text)
         self.assertNotIn('| sed -u "s/^/[node${index}] /"', text)
 
         # Pod placement, addresses, and visible devices are supplied by LWS/K8s,
@@ -122,6 +138,12 @@ class MultiNodeWorkflowTests(unittest.TestCase):
             "startup_timeout_seconds": "3600",
             "run_timeout_seconds": "14400",
             "pvc_name": "recipe-ci-pvc",
+            "aisbench_root": (
+                "/root/.cache/recipe-ci/tools/aisbench/cache-key/source"
+            ),
+            "aisbench_bin": (
+                "/root/.cache/recipe-ci/tools/aisbench/cache-key/venv/bin/ais_bench"
+            ),
         }
         for name, replacement in replacements.items():
             text = re.sub(r"{{\s*" + re.escape(name) + r"\s*}}", replacement, text)
@@ -219,12 +241,16 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertEqual(volumes["shm-volume"]["emptyDir"]["sizeLimit"], "16Gi")
         env = {item["name"]: item["value"] for item in leader["env"]}
         self.assertEqual(env["RECIPE_CI_NODE_COUNT"], "4")
-        self.assertEqual(env["RECIPE_CI_INSTALL_AISBENCH"], "true")
+        self.assertNotIn("RECIPE_CI_INSTALL_AISBENCH", env)
+        self.assertNotIn("AIS_BENCH_ROOT", env)
         self.assertEqual(
-            env["AIS_BENCH_ROOT"],
-            "/root/.cache/recipe-ci/tools/aisbench/benchmark",
+            env["RECIPE_AISBENCH_ROOT"],
+            "/root/.cache/recipe-ci/tools/aisbench/cache-key/source",
         )
-        self.assertEqual(env["RECIPE_AISBENCH_ROOT"], env["AIS_BENCH_ROOT"])
+        self.assertEqual(
+            env["RECIPE_AISBENCH_BIN"],
+            "/root/.cache/recipe-ci/tools/aisbench/cache-key/venv/bin/ais_bench",
+        )
         self.assertEqual(
             env["PIP_INDEX_URL"],
             "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple",
@@ -242,24 +268,19 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         workflow = REUSABLE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('kubectl delete leaderworkerset "$LWS_NAME"', workflow)
         self.assertIn("--ignore-not-found=true --wait=false", workflow)
-        self.assertIn("deadline=$((SECONDS + 180))", workflow)
-        self.assertIn('du -sh "$bundle"', workflow)
         self.assertIn("tar -czf /tmp/recipe-ci-bundle.tar.gz", workflow)
         self.assertIn("uses: actions/checkout@v7", workflow)
         self.assertNotIn("uses: actions/checkout@v4", workflow)
-        self.assertNotIn("uses: ascend-gha-runners/artifact", workflow)
-        self.assertIn("obsutil_linux_${obsutil_arch}.tar.gz", workflow)
-        self.assertIn('"$obsutil" cp /tmp/recipe-ci-bundle.tar.gz', workflow)
-        self.assertIn("OBS_BUCKET: mindcluster", workflow)
-        self.assertIn("OBS_PREFIX: vllm-ascend-recipe", workflow)
-        self.assertIn("OBS_ENDPOINT: obs.cn-north-4.myhuaweicloud.com", workflow)
-        self.assertIn("config returned $config_status", workflow)
-        self.assertIn("::error title=OBS artifact upload failed", workflow)
-        self.assertIn('upload_log="$RECIPE_CI_RUN_ROOT/upload-obs.log"', workflow)
+        self.assertIn("uses: ascend-gha-runners/artifact/upload@v0.3", workflow)
+        self.assertNotIn("obsutil", workflow)
+        self.assertNotIn("OBS_BUCKET", workflow)
+        self.assertNotIn("OBS_ENDPOINT", workflow)
         self.assertIn("uses: actions/upload-artifact@v7", workflow)
         self.assertNotIn("uses: actions/upload-artifact@v4", workflow)
         self.assertIn("compression-level: 0", workflow)
-        self.assertIn("Neither OBS nor GitHub artifact upload succeeded", workflow)
+        self.assertNotIn("Neither OBS nor GitHub artifact upload succeeded", workflow)
+        self.assertNotIn("Report Recipe CI bundle upload status", workflow)
+        self.assertIn("steps.upload_obs.outcome != 'success'", workflow)
         self.assertIn("steps.upload_obs.outcome == 'success'", workflow)
 
     def test_one_run_script_accepts_local_ips_or_lws_dns(self) -> None:
@@ -271,7 +292,7 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertIn("RECIPE_CI_STARTUP_TIMEOUT_SECONDS:-300", text)
         self.assertIn("awk 'NR == 1 {print $1}' || true", text)
         self.assertIn("Waiting for cluster DNS", text)
-        self.assertIn("npu-smi info", text)
+        self.assertNotIn("npu-smi info", text)
         self.assertIn('python3 -u "$SCRIPT_DIR/runner.py"', text)
         self.assertFalse((ROOT / "scripts/recipe_ci/k8s/run_node.sh").exists())
         self.assertNotIn("pytest", text)

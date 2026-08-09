@@ -63,8 +63,7 @@ class AisbenchResultTests(unittest.TestCase):
                 "path=__RECIPE_MODEL_PATH__, "
                 "model=__RECIPE_SERVED_MODEL_NAME__, "
                 "host_ip=__RECIPE_ENDPOINT_HOST__, "
-                "host_port=__RECIPE_ENDPOINT_PORT__, "
-                "max_out_len=__RECIPE_AISBENCH_MAX_OUT_LEN__)]\n",
+                "host_port=__RECIPE_ENDPOINT_PORT__)]\n",
                 encoding="utf-8",
             )
             environment = {
@@ -82,19 +81,23 @@ class AisbenchResultTests(unittest.TestCase):
             self.assertEqual(model["model"], "fake")
             self.assertEqual(model["host_ip"], "10.0.0.8")
             self.assertEqual(model["host_port"], 38085)
-            self.assertEqual(model["max_out_len"], 512)
 
     def test_accuracy_summary_is_translated_and_gated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory)
-            (artifact / "summary.csv").write_text(
+            summary = (
+                artifact
+                / "outputs/default/20260809_142027/summary/summary_20260809.csv"
+            )
+            summary.parent.mkdir(parents=True)
+            summary.write_text(
                 "dataset,version,metric,mode,total_count,recipe-ci-vllm\n"
-                "gsm8k,1,accuracy,gen,8,0.82\n",
+                "gsm8k,1,accuracy,gen,8,82.00 (7/8)\n",
                 encoding="utf-8",
             )
             score, source = accuracy_score(artifact)
-            self.assertEqual(score, 0.82)
-            self.assertEqual(source.name, "summary.csv")
+            self.assertEqual(score, 82.0)
+            self.assertEqual(source, summary)
 
             result_file = artifact / "result.json"
             result = subprocess.run(
@@ -107,9 +110,9 @@ class AisbenchResultTests(unittest.TestCase):
                     "--result-file",
                     str(result_file),
                     "--baseline",
-                    "0.85",
+                    "85",
                     "--allowed-drop",
-                    "0.02",
+                    "2",
                 ],
                 text=True,
                 stdout=subprocess.PIPE,
@@ -120,25 +123,30 @@ class AisbenchResultTests(unittest.TestCase):
             value = json.loads(result_file.read_text(encoding="utf-8"))
             self.assertEqual(value["status"], "failed")
             self.assertEqual(value["mode"], "gate")
-            self.assertEqual(value["metrics"]["accuracy"], 0.82)
+            self.assertEqual(value["metrics"]["accuracy"], 82.0)
 
     def test_performance_json_and_csv_are_translated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory)
-            (artifact / "performance.json").write_text(
+            performance = (
+                artifact
+                / "outputs/default/20260809_142027/performances/recipe-ci-vllm"
+            )
+            performance.mkdir(parents=True)
+            (performance / "gsm8k.json").write_text(
                 json.dumps(
                     {
-                        "Request Throughput": "0.2665 req/s",
-                        "Output Token Throughput": "8.529 token/s",
+                        "Request Throughput": {"total": "0.2665 req/s"},
+                        "Output Token Throughput": {"total": "8.529 token/s"},
                     }
                 ),
                 encoding="utf-8",
             )
-            (artifact / "performance.csv").write_text(
+            (performance / "gsm8k.csv").write_text(
                 "Performance Parameters,Stage,Average,Min,Max,Median,P75,P90,P99,N\n"
-                "E2E Latency,total,7503.7,1,2,3,4,5,6,2\n"
-                "TTFT,total,100.5,1,2,3,4,5,6,2\n"
-                "TPOT,total,20.25,1,2,3,4,5,6,2\n",
+                "E2EL,total,7503.7 ms,1,2,3,4,5,6,2\n"
+                "TTFT,total,100.5 ms,1,2,3,4,5,6,2\n"
+                "TPOT,total,20.25 ms,1,2,3,4,5,6,2\n",
                 encoding="utf-8",
             )
 
@@ -151,8 +159,19 @@ class AisbenchResultTests(unittest.TestCase):
             self.assertEqual(metrics["tpot_ms"], 20.25)
             self.assertEqual(
                 {path.name for path in sources},
-                {"performance.json", "performance.csv"},
+                {"gsm8k.json", "gsm8k.csv"},
             )
+
+    def test_performance_parser_rejects_legacy_fuzzy_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory)
+            (artifact / "performance.json").write_text(
+                json.dumps({"Request Throughput": "1 req/s"}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "run directory not found"):
+                performance_metrics(artifact)
 
 
 if __name__ == "__main__":

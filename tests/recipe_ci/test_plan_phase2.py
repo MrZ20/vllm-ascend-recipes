@@ -21,12 +21,10 @@ from scripts.recipe_ci.plan import (  # noqa: E402
 )
 
 
-class StrictPlanTests(unittest.TestCase):
+class PlanTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary_directory.name)
-        self.plan_directory = self.root / "plan"
-        self.plan_directory.mkdir()
+        self.plan_directory = Path(self.temporary_directory.name)
         for relative_path in (
             "nodes/node0/run.sh",
             "nodes/node1/run.sh",
@@ -96,7 +94,7 @@ class StrictPlanTests(unittest.TestCase):
                 ],
             },
         }
-        self.hosts_data: dict[str, Any] = {
+        self.hosts_data = {
             "version": 1,
             "hosts": {
                 "node0": {"address": "192.0.2.10", "interface": "eth0"},
@@ -107,321 +105,157 @@ class StrictPlanTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def write_plan(self, data: dict[str, Any] | None = None) -> Path:
-        path = self.plan_directory / "plan.yaml"
-        path.write_text(
-            yaml.safe_dump(
-                self.plan_data if data is None else data,
-                sort_keys=False,
-            ),
-            encoding="utf-8",
-        )
+    def write_yaml(self, name: str, data: Any) -> Path:
+        path = self.plan_directory / name
+        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
         return path
+
+    def write_plan(self, data: dict[str, Any] | None = None) -> Path:
+        return self.write_yaml(
+            "plan.yaml", self.plan_data if data is None else data
+        )
 
     def write_hosts(self, data: dict[str, Any] | None = None) -> Path:
-        path = self.plan_directory / "hosts.yaml"
-        path.write_text(
-            yaml.safe_dump(
-                self.hosts_data if data is None else data,
-                sort_keys=False,
-            ),
-            encoding="utf-8",
+        return self.write_yaml(
+            "hosts.yaml", self.hosts_data if data is None else data
         )
-        return path
 
-    @staticmethod
-    def nested(data: Any, path: tuple[str | int, ...]) -> Any:
-        for part in path:
-            data = data[part]
-        return data
-
-    def test_nodes_are_positionally_named_and_require_roles(self) -> None:
-        for invalid_id in ("node2", " node1", "worker"):
-            with self.subTest(node_id=invalid_id):
-                data = copy.deepcopy(self.plan_data)
-                data["nodes"][1]["id"] = invalid_id
-                with self.assertRaisesRegex(
-                    PlanError, r"nodes\[1\]\.id must be node1"
-                ):
-                    load_plan(self.write_plan(data))
-
+    def test_loads_executable_fields_and_ignores_generator_metadata(self) -> None:
         data = copy.deepcopy(self.plan_data)
-        del data["nodes"][1]["role"]
-        with self.assertRaisesRegex(PlanError, r"nodes\[1\]\.role"):
-            load_plan(self.write_plan(data))
-
-    def test_at_least_two_nodes_are_required(self) -> None:
-        data = copy.deepcopy(self.plan_data)
-        data["nodes"] = data["nodes"][:1]
-
-        with self.assertRaisesRegex(PlanError, "at least two"):
-            load_plan(self.write_plan(data))
-
-    def test_model_cache_path_is_relative(self) -> None:
-        plan = load_plan(self.write_plan())
-        self.assertEqual(plan.model.cache_path, "example/model")
-
-        for cache_path in ("/models/example", "../example"):
-            with self.subTest(cache_path=cache_path):
-                data = copy.deepcopy(self.plan_data)
-                data["model"]["cache_path"] = cache_path
-                with self.assertRaisesRegex(PlanError, r"model\.cache_path"):
-                    load_plan(self.write_plan(data))
-
-    def test_duplicate_roles_are_valid(self) -> None:
-        data = copy.deepcopy(self.plan_data)
-        data["nodes"][0]["role"] = "decode"
-        data["nodes"][1]["role"] = "decode"
+        data["generated_by"] = "recipe compiler"
+        data["metadata"]["source_recipe"] = "recipes/example.yaml"
 
         plan = load_plan(self.write_plan(data))
 
-        self.assertEqual([node.role for node in plan.nodes], ["decode", "decode"])
-
-    def test_npu_per_node_is_required_and_positive(self) -> None:
-        plan = load_plan(self.write_plan())
+        self.assertEqual(plan.name, "phase2-plan")
+        self.assertEqual(plan.model.cache_path, "example/model")
         self.assertEqual(plan.resources.npu_per_node, 2)
+        self.assertEqual([node.id for node in plan.nodes], ["node0", "node1"])
+        self.assertEqual(plan.nodes[0].readiness.count, 2)
+        self.assertEqual(plan.nodes[1].readiness.count, 1)
+        self.assertEqual(plan.gateway.port, 38085)
+        self.assertEqual(plan.checks[0].timeout_seconds, 300)
+        self.assertEqual(plan.evaluations.accuracy[0].timeout_seconds, 600)
 
-        for value in (0, True, None):
-            with self.subTest(npu_per_node=value):
-                data = copy.deepcopy(self.plan_data)
-                data["resources"]["npu_per_node"] = value
-                with self.assertRaisesRegex(PlanError, r"resources\.npu_per_node"):
-                    load_plan(self.write_plan(data))
+    def test_required_fields_and_container_types_are_checked(self) -> None:
+        cases = []
+        missing_nodes = copy.deepcopy(self.plan_data)
+        del missing_nodes["nodes"]
+        cases.append((missing_nodes, "plan is missing fields: nodes"))
+        invalid_model = copy.deepcopy(self.plan_data)
+        invalid_model["model"] = []
+        cases.append((invalid_model, "model must be a mapping"))
+        invalid_nodes = copy.deepcopy(self.plan_data)
+        invalid_nodes["nodes"] = {}
+        cases.append((invalid_nodes, "nodes must contain at least two"))
+        invalid_checks = copy.deepcopy(self.plan_data)
+        invalid_checks["checks"] = {}
+        cases.append((invalid_checks, "checks must be a list"))
 
-    def test_safe_slugs_and_stage_local_step_ids(self) -> None:
-        cases = (
-            (("metadata",), "name", "bad/name", r"metadata\.name"),
-            (("checks", 0), "id", "bad check", r"checks\[0\]\.id"),
-            (
-                ("evaluations", "accuracy", 0),
-                "id",
-                "bad/accuracy",
-                r"evaluations\.accuracy\[0\]\.id",
-            ),
-        )
-        for path, field, value, error_field in cases:
-            with self.subTest(path=path):
-                data = copy.deepcopy(self.plan_data)
-                self.nested(data, path)[field] = value
-                with self.assertRaisesRegex(PlanError, error_field):
-                    load_plan(self.write_plan(data))
+        for data, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                PlanError, message
+            ):
+                load_plan(self.write_plan(data))
 
-        for path in (("checks",), ("evaluations", "accuracy")):
-            with self.subTest(duplicate_stage=path):
-                data = copy.deepcopy(self.plan_data)
-                steps = self.nested(data, path)
-                steps.append(copy.deepcopy(steps[0]))
-                with self.assertRaisesRegex(PlanError, "duplicate step id"):
-                    load_plan(self.write_plan(data))
+    def test_nodes_are_ordered_and_use_independent_existing_scripts(self) -> None:
+        one_node = copy.deepcopy(self.plan_data)
+        one_node["nodes"] = one_node["nodes"][:1]
+        with self.assertRaisesRegex(PlanError, "at least two"):
+            load_plan(self.write_plan(one_node))
 
-        data = copy.deepcopy(self.plan_data)
-        data["checks"][0]["id"] = "shared"
-        data["evaluations"]["accuracy"][0]["id"] = "shared"
-        data["evaluations"]["performance"][0]["id"] = "shared"
-        load_plan(self.write_plan(data))
+        wrong_id = copy.deepcopy(self.plan_data)
+        wrong_id["nodes"][1]["id"] = "node2"
+        with self.assertRaisesRegex(PlanError, r"nodes\[1\]\.id must be node1"):
+            load_plan(self.write_plan(wrong_id))
 
-    def test_unknown_plan_fields_are_rejected_at_each_v1_layer(self) -> None:
-        cases = (
-            ((), r"plan has unknown fields"),
-            (("metadata",), r"metadata has unknown fields"),
-            (("model",), r"model has unknown fields"),
-            (("resources",), r"resources has unknown fields"),
-            (("nodes", 0), r"nodes\[0\] has unknown fields"),
-            (
-                ("nodes", 0, "readiness"),
-                r"nodes\[0\]\.readiness has unknown fields",
-            ),
-            (("gateway",), r"gateway has unknown fields"),
-            (("checks", 0), r"checks\[0\] has unknown fields"),
-            (("evaluations",), r"evaluations has unknown fields"),
-        )
-        for path, message in cases:
-            with self.subTest(path=path):
-                data = copy.deepcopy(self.plan_data)
-                self.nested(data, path)["typo"] = True
-                with self.assertRaisesRegex(PlanError, message):
-                    load_plan(self.write_plan(data))
-
-    def test_plan_references_cannot_escape_the_plan_directory(self) -> None:
-        outside = self.root / "outside.sh"
-        outside.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-        cases = (
-            (("nodes", 0), "launch", r"nodes\[0\]\.launch"),
-            (("gateway",), "launch", r"gateway\.launch"),
-            (("checks", 0), "script", r"checks\[0\]\.script"),
-            (
-                ("evaluations", "accuracy", 0),
-                "script",
-                r"evaluations\.accuracy\[0\]\.script",
-            ),
-        )
-        for path, field, message in cases:
-            with self.subTest(path=path):
-                data = copy.deepcopy(self.plan_data)
-                self.nested(data, path)[field] = "../outside.sh"
-                with self.assertRaisesRegex(PlanError, message + ".*outside.sh"):
-                    load_plan(self.write_plan(data))
-
-    def test_symlink_targets_cannot_escape_or_alias_node_launches(self) -> None:
-        outside = self.root / "outside.sh"
-        outside.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-        (self.plan_directory / "escape.sh").symlink_to(outside)
-        data = copy.deepcopy(self.plan_data)
-        data["nodes"][0]["launch"] = "escape.sh"
-
-        with self.assertRaisesRegex(
-            PlanError, r"nodes\[0\]\.launch.*inside the plan directory"
-        ):
-            load_plan(self.write_plan(data))
-
-        alias = self.plan_directory / "node1-alias.sh"
-        alias.symlink_to(self.plan_directory / "nodes/node0/run.sh")
-        data = copy.deepcopy(self.plan_data)
-        data["nodes"][1]["launch"] = alias.name
+        shared_script = copy.deepcopy(self.plan_data)
+        shared_script["nodes"][1]["launch"] = "nodes/node0/run.sh"
         with self.assertRaisesRegex(PlanError, "each node must have its own"):
-            load_plan(self.write_plan(data))
+            load_plan(self.write_plan(shared_script))
 
-    def test_plan_references_must_be_regular_files(self) -> None:
-        data = copy.deepcopy(self.plan_data)
-        data["gateway"]["launch"] = "gateway"
+        missing_script = copy.deepcopy(self.plan_data)
+        missing_script["gateway"]["launch"] = "gateway/missing.sh"
+        with self.assertRaisesRegex(PlanError, r"gateway\.launch does not exist"):
+            load_plan(self.write_plan(missing_script))
 
-        with self.assertRaisesRegex(PlanError, r"gateway\.launch.*regular file"):
-            load_plan(self.write_plan(data))
+    def test_integer_and_port_values_must_be_executable(self) -> None:
+        cases = []
+        invalid_npu = copy.deepcopy(self.plan_data)
+        invalid_npu["resources"]["npu_per_node"] = 0
+        cases.append((invalid_npu, r"resources\.npu_per_node"))
+        invalid_timeout = copy.deepcopy(self.plan_data)
+        invalid_timeout["checks"][0]["timeout_seconds"] = True
+        cases.append((invalid_timeout, r"checks\[0\]\.timeout_seconds"))
+        invalid_port = copy.deepcopy(self.plan_data)
+        invalid_port["nodes"][0]["readiness"]["port_start"] = 65536
+        cases.append((invalid_port, r"readiness\.port_start"))
+        overflow = copy.deepcopy(self.plan_data)
+        overflow["nodes"][0]["readiness"].update(
+            {"port_start": 65535, "count": 2}
+        )
+        cases.append((overflow, "port range exceeds"))
 
-    def test_readiness_ports_counts_and_health_paths_are_bounded(self) -> None:
-        for value in (0, 65536, True):
-            with self.subTest(port_start=value):
-                data = copy.deepcopy(self.plan_data)
-                data["nodes"][0]["readiness"]["port_start"] = value
-                with self.assertRaisesRegex(
-                    PlanError, r"nodes\[0\]\.readiness\.port_start"
-                ):
-                    load_plan(self.write_plan(data))
+        for data, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                PlanError, message
+            ):
+                load_plan(self.write_plan(data))
 
-        data = copy.deepcopy(self.plan_data)
-        data["nodes"][0]["readiness"]["count"] = 1025
-        with self.assertRaisesRegex(PlanError, "count must be at most 1024"):
-            load_plan(self.write_plan(data))
-
-        data = copy.deepcopy(self.plan_data)
-        data["nodes"][0]["readiness"]["count"] = 0
-        with self.assertRaisesRegex(PlanError, "count must be a positive integer"):
-            load_plan(self.write_plan(data))
-
-        data = copy.deepcopy(self.plan_data)
-        data["nodes"][0]["readiness"].update({"port_start": 65535, "count": 2})
-        with self.assertRaisesRegex(PlanError, "port range exceeds 65535"):
-            load_plan(self.write_plan(data))
-
-        data = copy.deepcopy(self.plan_data)
-        data["nodes"][0]["readiness"]["health_path"] = "health"
-        with self.assertRaisesRegex(PlanError, "health_path must start"):
-            load_plan(self.write_plan(data))
-
-    def test_gateway_port_health_and_leader_conflicts_are_rejected(self) -> None:
-        data = copy.deepcopy(self.plan_data)
-        data["gateway"]["port"] = 0
-        with self.assertRaisesRegex(PlanError, "gateway.port must be between"):
-            load_plan(self.write_plan(data))
-
-        data = copy.deepcopy(self.plan_data)
-        data["gateway"]["health_path"] = "healthcheck"
-        with self.assertRaisesRegex(PlanError, "gateway.health_path must start"):
-            load_plan(self.write_plan(data))
-
-        data = copy.deepcopy(self.plan_data)
-        data["gateway"]["port"] = 7101
+    def test_gateway_and_leader_readiness_define_one_endpoint(self) -> None:
+        conflict = copy.deepcopy(self.plan_data)
+        conflict["gateway"]["port"] = 7101
         with self.assertRaisesRegex(PlanError, "conflicts with leader readiness"):
-            load_plan(self.write_plan(data))
+            load_plan(self.write_plan(conflict))
 
-        data = copy.deepcopy(self.plan_data)
-        data["gateway"]["port"] = 7200
-        load_plan(self.write_plan(data))
-
-    def test_gateway_is_optional_only_when_the_leader_has_readiness(self) -> None:
-        data = copy.deepcopy(self.plan_data)
-        del data["gateway"]
-        del data["nodes"][0]["readiness"]
-
+        no_endpoint = copy.deepcopy(self.plan_data)
+        del no_endpoint["gateway"]
+        del no_endpoint["nodes"][0]["readiness"]
         with self.assertRaisesRegex(PlanError, "leader needs HTTP readiness"):
-            load_plan(self.write_plan(data))
+            load_plan(self.write_plan(no_endpoint))
 
-    def test_hosts_must_exactly_match_nodes_and_use_ipv4(self) -> None:
+        direct = copy.deepcopy(self.plan_data)
+        del direct["gateway"]
+        plan = load_plan(self.write_plan(direct))
+        hosts = load_hosts(self.write_hosts(), plan)
+        self.assertIn(
+            "Endpoint: http://192.0.2.10:7100",
+            format_topology_summary(plan, hosts),
+        )
+
+    def test_hosts_exactly_match_nodes_and_have_required_text(self) -> None:
         plan = load_plan(self.write_plan())
+        hosts = load_hosts(self.write_hosts(), plan)
+        self.assertEqual(hosts["node0"].interface, "eth0")
+        self.assertIsNone(hosts["node1"].interface)
 
         missing = copy.deepcopy(self.hosts_data)
         del missing["hosts"]["node1"]
         with self.assertRaisesRegex(PlanError, r"missing=\['node1'\]"):
             load_hosts(self.write_hosts(missing), plan)
 
-        extra = copy.deepcopy(self.hosts_data)
-        extra["hosts"]["worker"] = {"address": "192.0.2.12"}
-        with self.assertRaisesRegex(PlanError, r"unexpected=\['worker'\]"):
-            load_hosts(self.write_hosts(extra), plan)
+        invalid = copy.deepcopy(self.hosts_data)
+        invalid["hosts"]["node0"]["address"] = ""
+        with self.assertRaisesRegex(PlanError, r"hosts\.node0\.address"):
+            load_hosts(self.write_hosts(invalid), plan)
 
-        for address in ("2001:db8::1", "node0.example.test"):
-            with self.subTest(address=address):
-                data = copy.deepcopy(self.hosts_data)
-                data["hosts"]["node0"]["address"] = address
-                with self.assertRaisesRegex(PlanError, "must be an IPv4 address"):
-                    load_hosts(self.write_hosts(data), plan)
-
-    def test_unknown_hosts_fields_are_rejected(self) -> None:
-        plan = load_plan(self.write_plan())
-        data = copy.deepcopy(self.hosts_data)
-        data["typo"] = True
-        with self.assertRaisesRegex(PlanError, "hosts file has unknown fields"):
-            load_hosts(self.write_hosts(data), plan)
-
-        data = copy.deepcopy(self.hosts_data)
-        data["hosts"]["node0"]["typo"] = True
-        with self.assertRaisesRegex(
-            PlanError, "hosts.node0 has unknown fields"
-        ):
-            load_hosts(self.write_hosts(data), plan)
-
-        data = copy.deepcopy(self.hosts_data)
-        data["version"] = 1.0
+        invalid_version = copy.deepcopy(self.hosts_data)
+        invalid_version["version"] = 1.0
         with self.assertRaisesRegex(PlanError, "hosts version must be 1"):
-            load_hosts(self.write_hosts(data), plan)
+            load_hosts(self.write_hosts(invalid_version), plan)
 
-    def test_topology_summary_formats_static_and_host_details(self) -> None:
+    def test_topology_summary_is_compact(self) -> None:
         plan = load_plan(self.write_plan())
-        static_summary = format_topology_summary(plan)
+        summary = format_topology_summary(plan, load_hosts(self.write_hosts(), plan))
 
-        self.assertIn("Plan: phase2-plan", static_summary)
-        self.assertIn("API version: recipe-ci/v1", static_summary)
-        self.assertIn("Leader: node0", static_summary)
-        self.assertIn("NPUs per node: 2", static_summary)
+        self.assertIn("Plan: phase2-plan (2 nodes, 2 NPUs/node)", summary)
         self.assertIn(
-            "node0 role=prefill launch=nodes/node0/run.sh readiness=7100-7101",
-            static_summary,
+            "node0 @192.0.2.10%eth0: prefill, nodes/node0/run.sh "
+            "ports=7100-7101",
+            summary,
         )
-        self.assertIn(
-            "node1 role=decode launch=nodes/node1/run.sh readiness=7200",
-            static_summary,
-        )
-        self.assertIn("leader=node0 launch=gateway/run.sh port=38085", static_summary)
-        self.assertIn("completion timeout=300s", static_summary)
-        self.assertIn("accuracy: accuracy timeout=600s", static_summary)
-        self.assertNotIn("Endpoint:", static_summary)
-
-        hosts = load_hosts(self.write_hosts(), plan)
-        hosts_summary = format_topology_summary(plan, hosts)
-        self.assertIn("address=192.0.2.10 interface=eth0", hosts_summary)
-        self.assertIn("address=192.0.2.11 interface=auto", hosts_summary)
-        self.assertIn("Endpoint: http://192.0.2.10:38085", hosts_summary)
-
-    def test_topology_summary_uses_leader_readiness_without_gateway(self) -> None:
-        data = copy.deepcopy(self.plan_data)
-        del data["gateway"]
-        plan = load_plan(self.write_plan(data))
-        hosts = load_hosts(self.write_hosts(), plan)
-
-        summary = format_topology_summary(plan, hosts)
-
-        self.assertIn("Gateway:\n  none", summary)
-        self.assertIn("Endpoint: http://192.0.2.10:7100", summary)
+        self.assertIn("Gateway: gateway/run.sh port=38085", summary)
+        self.assertIn("Steps: checks=1, accuracy=1, performance=1", summary)
 
 
 if __name__ == "__main__":

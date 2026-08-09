@@ -99,9 +99,10 @@ rank 已连接。每节点直接消费 `ASCEND_RT_VISIBLE_DEVICES` 中的两张�
 ```
 
 plan 中声明的 check、accuracy 和 performance 都会执行，因此应先按
-`docs/MULTI_NODE_RECIPE_CI.md` 安装 AISBench 和 GSM8K 数据集。plan 内的
+`docs/MULTI_NODE_RECIPE_CI.md` 准备固定 AISBench，并设置 `RECIPE_AISBENCH_ROOT` 与
+`RECIPE_AISBENCH_BIN`。这个 plan 自带离线 GSM8K 小样本，evaluation 只会把它链接到
+当前步骤的 artifact 目录，不会修改共享的 AISBench 安装或缓存。plan 内的
 `vllm_api_general_chat.py` 和 `vllm_api_stream_chat.py` 分别供精度和性能评测使用，
-evaluation 会用当前 endpoint 和 served model 渲染后再执行；样本数可通过
-`RECIPE_AISBENCH_ACCURACY_NUM_PROMPTS` 和
-`RECIPE_AISBENCH_PERFORMANCE_NUM_PROMPTS` 调整。Runner 不会清理任何代理环境变量，
+evaluation 会用当前 endpoint 和 served model 渲染后再执行；模型配置、数据集和样本数
+固定在最终执行中间态中，需要改变时应重新生成 plan。Runner 不会清理任何代理环境变量，
 只会把节点 IP 加入 `NO_PROXY`。

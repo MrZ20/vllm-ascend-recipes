@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import importlib.metadata
 import os
-import platform
 import socket
 import subprocess
 import sys
@@ -50,9 +48,7 @@ from scripts.recipe_ci.result import (  # noqa: E402
     RunFailure,
     build_final_result,
     build_node_result,
-    process_record,
     read_json,
-    utc_now,
     write_json_atomic,
 )
 
@@ -274,8 +270,6 @@ def run_steps(
         step_environment = environment.copy()
         step_environment.update(
             {
-                # v1 compatibility: existing plans use the stage directory.
-                "RECIPE_ARTIFACT_DIR": str(stage_directory),
                 "RECIPE_STEP_ARTIFACT_DIR": str(step_directory),
                 "RECIPE_STEP_RESULT_FILE": str(result_path),
             }
@@ -290,7 +284,6 @@ def run_steps(
             environment=step_environment,
             log_path=log_path,
             stage=stage,
-            node_id=plan.leader.id,
         )
         managed_processes.append(item)
         try:
@@ -305,11 +298,11 @@ def run_steps(
             raise StageFailure(
                 RunFailure(
                     category=category,
-                    stage=stage,
-                    node_id=plan.leader.id,
-                    step_id=step.id,
-                    message=f"{stage} {step.id} timed out after {step.timeout_seconds}s",
-                    log_path=log_path.relative_to(artifact_directory.parent).as_posix(),
+                    message=(
+                        f"{stage} {step.id} timed out after "
+                        f"{step.timeout_seconds}s; see "
+                        f"{log_path.relative_to(artifact_directory.parent)}"
+                    ),
                 )
             ) from error
         if return_code != 0:
@@ -321,12 +314,7 @@ def run_steps(
             raise StageFailure(
                 RunFailure(
                     category=category,
-                    stage=stage,
-                    node_id=plan.leader.id,
-                    step_id=step.id,
                     message=message,
-                    return_code=return_code,
-                    log_path=log_path.relative_to(artifact_directory.parent).as_posix(),
                 )
             )
 
@@ -338,13 +326,7 @@ def run_steps(
                 raise StageFailure(
                     RunFailure(
                         category="evaluation_failed",
-                        stage=stage,
-                        node_id=plan.leader.id,
-                        step_id=step.id,
                         message=f"invalid step result {result_path}: {error}",
-                        log_path=log_path.relative_to(
-                            artifact_directory.parent
-                        ).as_posix(),
                     )
                 ) from error
             if result.get("status") != "passed":
@@ -354,52 +336,21 @@ def run_steps(
                 raise StageFailure(
                     RunFailure(
                         category=category,
-                        stage=stage,
-                        node_id=plan.leader.id,
-                        step_id=step.id,
                         message=(
                             f"{stage} {step.id} reported status "
                             f"{result.get('status')!r}"
                         ),
-                        log_path=log_path.relative_to(
-                            artifact_directory.parent
-                        ).as_posix(),
                     )
                 )
         elif stage != "checks":
             raise StageFailure(
                 RunFailure(
                     category="evaluation_failed",
-                    stage=stage,
-                    node_id=plan.leader.id,
-                    step_id=step.id,
                     message=f"evaluation did not write {result_path}",
-                    log_path=log_path.relative_to(artifact_directory.parent).as_posix(),
                 )
             )
         results[step.id] = result
     return results
-
-
-def write_environment(path: Path, plan: Plan, node: Node) -> None:
-    packages: dict[str, str] = {}
-    for distribution in ("vllm", "vllm-ascend", "ais-bench-benchmark"):
-        try:
-            packages[distribution] = importlib.metadata.version(distribution)
-        except importlib.metadata.PackageNotFoundError:
-            continue
-    value = {
-        "python": sys.version.split()[0],
-        "platform": platform.platform(),
-        "architecture": platform.machine(),
-        "packages": packages,
-        "plan": plan.name,
-        "node_id": node.id,
-    }
-    for name in ("RECIPE_CI_IMAGE", "GITHUB_SHA"):
-        if os.environ.get(name):
-            value[name.lower()] = os.environ[name]
-    write_json_atomic(path, value)
 
 
 def run_node(
@@ -414,7 +365,6 @@ def run_node(
     plan_artifact_directory = (args.artifact_root / plan.name).resolve()
     artifact_directory = plan_artifact_directory / node.id
     artifact_directory.mkdir(parents=True, exist_ok=True)
-    started_at = utc_now()
     environment = base_environment(
         plan,
         node,
@@ -446,9 +396,7 @@ def run_node(
     runtime_processes: list[ManagedProcess] = []
     primary_failure: RunFailure | None = None
     cleanup_failures: list[RunFailure] = []
-    warnings: list[str] = []
-    ready_at: str | None = None
-    terminal_at: str | None = None
+    service_ready = False
     terminal_status = "failed"
     check_results: dict[str, object] = {}
     evaluation_results: dict[str, object] = {}
@@ -463,7 +411,6 @@ def run_node(
                 coordinator = LeaderCoordinator(
                     [item.id for item in plan.nodes],
                     args.control_port,
-                    artifact_directory / "coordinator.log",
                 )
                 coordinator.start()
             else:
@@ -483,7 +430,6 @@ def run_node(
                 environment=environment,
                 log_path=artifact_directory / "service.log",
                 stage="service",
-                node_id=node.id,
             )
             managed_processes.append(service_process)
             runtime_processes.append(service_process)
@@ -500,13 +446,10 @@ def run_node(
                 raise StageFailure(
                     RunFailure(
                         category="startup_timeout",
-                        stage="service",
-                        node_id=node.id,
-                        message=str(error),
-                        log_path=f"{node.id}/service.log",
+                        message=f"{error}; see {node.id}/service.log",
                     )
                 ) from error
-            ready_at = utc_now()
+            service_ready = True
 
             if coordinator:
                 coordinator.state.mark_ready(node.id)
@@ -528,7 +471,6 @@ def run_node(
                         environment=environment,
                         log_path=artifact_directory / "gateway.log",
                         stage="gateway",
-                        node_id=node.id,
                     )
                     managed_processes.append(gateway_process)
                     runtime_processes.append(gateway_process)
@@ -548,10 +490,7 @@ def run_node(
                         raise StageFailure(
                             RunFailure(
                                 category="gateway_failed",
-                                stage="gateway",
-                                node_id=node.id,
-                                message=str(error),
-                                log_path=f"{node.id}/gateway.log",
+                                message=f"{error}; see {node.id}/gateway.log",
                             )
                         ) from error
                 else:
@@ -595,7 +534,6 @@ def run_node(
                 check_leader_runtime()
                 coordinator.state.finish("passed")
                 terminal_status = "passed"
-                terminal_at = utc_now()
             else:
                 client.mark_ready(node.id, args.startup_timeout_seconds)
                 print(f"[{node.id}] local service ready; waiting for the leader result")
@@ -603,7 +541,6 @@ def run_node(
                     args.run_timeout_seconds, check_local_runtime
                 )
                 terminal_status = str(state["status"])
-                terminal_at = utc_now()
                 if terminal_status != "passed":
                     category = (
                         "cancelled" if terminal_status == "cancelled" else "node_failed"
@@ -611,8 +548,6 @@ def run_node(
                     raise StageFailure(
                         RunFailure(
                             category=category,
-                            stage="coordination",
-                            node_id=node.id,
                             message=str(state.get("message") or terminal_status),
                         )
                     )
@@ -622,26 +557,18 @@ def run_node(
             terminal_status = "cancelled"
             primary_failure = RunFailure(
                 category="cancelled",
-                stage="runner",
-                node_id=node.id,
                 message=str(error),
             )
         except ManagedProcessExited as error:
             if error.item.stage == "gateway":
                 category = "gateway_failed"
-            elif ready_at is None:
+            elif not service_ready:
                 category = "launch_failed"
             else:
                 category = "node_failed"
             primary_failure = RunFailure(
                 category=category,
-                stage=error.item.stage or "service",
-                node_id=node.id,
                 message=str(error),
-                return_code=error.return_code,
-                log_path=error.item.log_path.relative_to(
-                    plan_artifact_directory
-                ).as_posix(),
             )
         except CoordinatorError as error:
             category = (
@@ -651,22 +578,16 @@ def run_node(
             )
             primary_failure = RunFailure(
                 category=category,
-                stage="coordination",
-                node_id=node.id,
                 message=str(error),
             )
         except (OSError, RunnerError) as error:
             primary_failure = RunFailure(
                 category="launch_failed",
-                stage="runner",
-                node_id=node.id,
                 message=str(error),
             )
         except Exception as error:
             primary_failure = RunFailure(
                 category="internal_error",
-                stage="runner",
-                node_id=node.id,
                 message=f"{type(error).__name__}: {error}",
             )
 
@@ -676,18 +597,20 @@ def run_node(
                 if primary_failure.category == "cancelled"
                 else "failed"
             )
-            terminal_at = terminal_at or utc_now()
             if coordinator:
                 try:
-                    coordinator.state.finish(terminal_status, primary_failure.message)
+                    if terminal_status == "cancelled":
+                        coordinator.state.finish("cancelled", primary_failure.message)
+                    else:
+                        coordinator.state.mark_failed(node.id, primary_failure.message)
                 except CoordinatorError as error:
-                    warnings.append(f"could not publish terminal status: {error}")
+                    print(f"warning: could not publish terminal status: {error}")
             else:
                 if primary_failure.category != "cancelled":
                     try:
                         client.mark_failed(node.id, primary_failure.message)
                     except CoordinatorError as error:
-                        warnings.append(f"could not report node failure: {error}")
+                        print(f"warning: could not report node failure: {error}")
 
         # Terminal is published before cleanup, but cleaned is not reported until
         # process groups are stopped, logs are closed, and node-result.json exists.
@@ -695,41 +618,14 @@ def run_node(
             cleanup_failures.append(
                 RunFailure(
                     category="cleanup_failed",
-                    stage="cleanup",
-                    node_id=node.id,
                     message=message,
                 )
             )
-
-        process_results = [
-            process_record(
-                name=item.name,
-                pid=item.pid,
-                process_group=item.process_group,
-                started_at=item.started_at,
-                stage=item.stage,
-                return_code=item.process.poll(),
-                log_path=item.log_path.relative_to(plan_artifact_directory),
-            )
-            for item in managed_processes
-        ]
-        write_environment(artifact_directory / "environment.json", plan, node)
         node_result = build_node_result(
             node_id=node.id,
-            role=node.role,
             status=terminal_status,
-            started_at=started_at,
-            processes=process_results,
-            ready_at=ready_at,
-            terminal_at=terminal_at,
-            primary_failure=primary_failure,
+            failure=primary_failure,
             cleanup_errors=cleanup_failures,
-            warnings=warnings,
-            artifacts=[
-                path.relative_to(plan_artifact_directory)
-                for path in sorted(artifact_directory.rglob("*"))
-                if path.is_file() and path.name != "node-result.json"
-            ],
         )
         write_json_atomic(artifact_directory / "node-result.json", node_result)
 
@@ -740,8 +636,6 @@ def run_node(
             except CoordinatorError as error:
                 cleanup_failure = RunFailure(
                     category="cleanup_failed",
-                    stage="cleanup",
-                    node_id=node.id,
                     message=str(error),
                 )
                 cleanup_failures.append(cleanup_failure)
@@ -752,7 +646,6 @@ def run_node(
             final_result = build_final_result(
                 plan=plan.name,
                 status=terminal_status,
-                started_at=started_at,
                 nodes={
                     node_id: {
                         "status": status,
@@ -762,9 +655,8 @@ def run_node(
                 },
                 checks=check_results,
                 evaluations=evaluation_results,
-                primary_failure=primary_failure,
+                failure=primary_failure,
                 cleanup_errors=cleanup_failures,
-                warnings=warnings,
             )
             write_json_atomic(plan_artifact_directory / "result.json", final_result)
             coordinator.close()
@@ -774,8 +666,6 @@ def run_node(
             except CoordinatorError as error:
                 cleanup_failure = RunFailure(
                     category="cleanup_failed",
-                    stage="cleanup",
-                    node_id=node.id,
                     message=f"could not report cleaned: {error}",
                 )
                 cleanup_failures.append(cleanup_failure)
@@ -784,16 +674,9 @@ def run_node(
                     terminal_status = "failed"
                 node_result = build_node_result(
                     node_id=node.id,
-                    role=node.role,
                     status=terminal_status,
-                    started_at=started_at,
-                    processes=process_results,
-                    ready_at=ready_at,
-                    terminal_at=terminal_at,
-                    primary_failure=primary_failure,
+                    failure=primary_failure,
                     cleanup_errors=cleanup_failures,
-                    warnings=warnings,
-                    artifacts=node_result["artifacts"],
                 )
                 write_json_atomic(
                     artifact_directory / "node-result.json", node_result

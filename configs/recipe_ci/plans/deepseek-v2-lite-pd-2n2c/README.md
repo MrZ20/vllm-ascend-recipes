@@ -109,14 +109,14 @@ IP 补充 `NO_PROXY`。
 ## AISBench 阶段
 
 plan 中声明的 completion、accuracy 和 performance 会全部执行。运行前应按
-`docs/MULTI_NODE_RECIPE_CI.md` 安装 AISBench。这个轻量 plan 自带 8 条离线 GSM8K
-格式样本，evaluation 会把它链接到 AISBench 的标准数据目录，不再运行时下载数据集。
+`docs/MULTI_NODE_RECIPE_CI.md` 准备固定 AISBench，并设置 `RECIPE_AISBENCH_ROOT` 与
+`RECIPE_AISBENCH_BIN`；`run.sh` 不会现场安装。这个轻量 plan 自带 8 条离线 GSM8K
+格式样本，evaluation 会把它链接到当前步骤的 artifact 目录，不会下载数据集，也不会
+修改共享的 AISBench 安装或缓存。
 
 plan 内的 `aisbench/models/vllm_api_general_chat.py` 和 `vllm_api_stream_chat.py` 是
 Recipe 转换产物，分别供精度和性能评测使用。evaluation 会根据当前 endpoint、模型路径和
-served model 将占位符渲染到 artifact 目录，无需修改 AISBench 安装目录。模型配置名可分别通过
-`RECIPE_AISBENCH_ACCURACY_MODEL_CONFIG` 和
-`RECIPE_AISBENCH_PERFORMANCE_MODEL_CONFIG` 覆盖；样本数可通过
-`RECIPE_AISBENCH_ACCURACY_NUM_PROMPTS` 和
-`RECIPE_AISBENCH_PERFORMANCE_NUM_PROMPTS` 调整。评测命令输出和 AISBench 产物都会
-写到该节点的 `accuracy/` 或 `performance/` artifact 目录。
+served model 将占位符渲染到 artifact 目录，无需修改 AISBench 安装目录。模型配置、
+数据集和样本数已经固定在这个最终执行中间态中；需要改变时应重新生成 plan，而不是在
+执行阶段通过兼容环境变量覆盖。评测命令输出和 AISBench 产物都会写到该节点的
+`accuracy/` 或 `performance/` artifact 目录。

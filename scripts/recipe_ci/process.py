@@ -9,8 +9,7 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
@@ -18,15 +17,6 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 DEFAULT_LOG_TAIL_LINES = 50
 DEFAULT_LOG_TAIL_BYTES = 16 * 1024
-
-
-def _utc_now() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
 
 
 @dataclass
@@ -38,17 +28,10 @@ class ManagedProcess:
     log_path: Path
     log_file: BinaryIO
     stage: str | None = None
-    node_id: str | None = None
-    started_at: str = field(default_factory=_utc_now)
-    process_group: int = field(init=False)
-
-    def __post_init__(self) -> None:
-        # start_new_session=True makes the child PID the stable process-group ID.
-        # Store it now because getpgid() stops working after the leader exits.
-        self.process_group = self.process.pid
 
     @property
-    def pid(self) -> int:
+    def process_group(self) -> int:
+        # start_new_session=True makes the child PID its stable process-group ID.
         return self.process.pid
 
 
@@ -79,7 +62,6 @@ def start_process(
     environment: Mapping[str, str],
     log_path: Path,
     stage: str | None = None,
-    node_id: str | None = None,
 ) -> ManagedProcess:
     """Start a logged command in a new session and process group."""
     if not command:
@@ -106,7 +88,6 @@ def start_process(
         log_path=log_path,
         log_file=log_file,
         stage=stage,
-        node_id=node_id,
     )
 
 
@@ -117,21 +98,14 @@ def tail_log(
     max_bytes: int = DEFAULT_LOG_TAIL_BYTES,
 ) -> str:
     """Return a bounded, replacement-decoded tail while preserving the full log."""
-    if max_lines < 1:
-        raise ValueError("max_lines must be positive")
-    if max_bytes < 1:
-        raise ValueError("max_bytes must be positive")
-
     try:
         with path.open("rb") as log_file:
             log_file.seek(0, os.SEEK_END)
             size = log_file.tell()
             log_file.seek(max(0, size - max_bytes))
             data = log_file.read(max_bytes)
-    except FileNotFoundError:
+    except OSError:
         return ""
-    except OSError as error:
-        return f"<unable to read log: {error}>"
 
     lines = data.decode("utf-8", errors="replace").splitlines()
     return "\n".join(lines[-max_lines:])
@@ -163,17 +137,7 @@ def wait_for_process(
     cancellation: threading.Event | None = None,
     poll_interval_seconds: float = 0.5,
 ) -> int:
-    """Wait for one step while its caller supervises the rest of the run.
-
-    ``check_runtime`` is intentionally caller-owned: the runner can keep its
-    service/gateway checks and coordinator failure classification in the main
-    lifecycle instead of hiding those policies in this module.
-    """
-    if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be positive")
-    if poll_interval_seconds <= 0:
-        raise ValueError("poll_interval_seconds must be positive")
-
+    """Wait for one step while the runner supervises services and cancellation."""
     deadline = time.monotonic() + timeout_seconds
     while True:
         if cancellation is not None and cancellation.is_set():
@@ -186,7 +150,6 @@ def wait_for_process(
         if check_runtime is not None:
             check_runtime()
 
-        # Avoid sleeping if the step finished during a runtime/coordinator check.
         return_code = item.process.poll()
         if return_code is not None:
             return return_code
@@ -213,14 +176,9 @@ def signal_cancellation_event(
     def request_cancellation(_signum: int, _frame: FrameType | None) -> None:
         cancellation.set()
 
-    try:
-        for signum in handled_signals:
-            previous_handlers[signum] = signal.getsignal(signum)
-            signal.signal(signum, request_cancellation)
-    except BaseException:
-        for signum, previous in previous_handlers.items():
-            signal.signal(signum, previous)
-        raise
+    for signum in handled_signals:
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, request_cancellation)
 
     try:
         yield cancellation
@@ -231,8 +189,6 @@ def signal_cancellation_event(
 
 def process_group_exists(process_group: int) -> bool:
     """Return whether a process group still has at least one member."""
-    if process_group <= 0:
-        raise ValueError("process_group must be positive")
     try:
         os.killpg(process_group, 0)
     except ProcessLookupError:
@@ -248,7 +204,6 @@ def _wait_for_process_groups(
     while True:
         alive: list[ManagedProcess] = []
         for item in processes:
-            # poll() also reaps a direct child that has already exited.
             item.process.poll()
             if process_group_exists(item.process_group):
                 alive.append(item)
@@ -268,11 +223,6 @@ def stop_processes(
     Cleanup diagnostics are returned instead of raised so a runner can retain its
     original execution failure as ``primary_failure``.
     """
-    if grace_period_seconds < 0:
-        raise ValueError("grace_period_seconds must not be negative")
-    if kill_timeout_seconds < 0:
-        raise ValueError("kill_timeout_seconds must not be negative")
-
     cleanup_errors: list[str] = []
     reversed_processes = list(reversed(processes))
     signal_targets: list[ManagedProcess] = []
@@ -293,7 +243,6 @@ def stop_processes(
 
     try:
         for item in signal_targets:
-            item.process.poll()
             if not process_group_exists(item.process_group):
                 continue
             try:

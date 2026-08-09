@@ -3,8 +3,7 @@ set -euo pipefail
 
 # launch_online_dp.py passes logical device indexes. Map them onto the cards
 # selected before starting the Runner, for example 4,5.
-IFS=',' read -r -a selected_devices <<< \
-    "${RECIPE_CI_VISIBLE_DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:-0,1}}"
+IFS=',' read -r -a selected_devices <<< "$RECIPE_CI_VISIBLE_DEVICES"
 export ASCEND_RT_VISIBLE_DEVICES="${selected_devices[$1]}"
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10

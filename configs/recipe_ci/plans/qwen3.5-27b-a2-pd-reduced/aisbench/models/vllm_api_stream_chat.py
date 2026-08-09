@@ -19,7 +19,7 @@ models = [
         host_ip=__RECIPE_ENDPOINT_HOST__,
         host_port=__RECIPE_ENDPOINT_PORT__,
         url="",
-        max_out_len=__RECIPE_AISBENCH_MAX_OUT_LEN__,
+        max_out_len=128,
         batch_size=1,
         trust_remote_code=False,
         generation_kwargs=dict(temperature=0.01, ignore_eos=False),

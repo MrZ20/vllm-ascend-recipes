@@ -7,13 +7,11 @@ import argparse
 import csv
 import json
 import os
-import runpy
+import re
 import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -51,14 +49,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def newest_files(directory: Path, suffix: str) -> list[Path]:
-    return sorted(
-        directory.rglob(f"*{suffix}"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-
-
 def render_model_config(template: Path, output: Path) -> None:
     substitutions = {
         "__RECIPE_MODEL_PATH__": ("RECIPE_MODEL_PATH", None, False),
@@ -69,11 +59,6 @@ def render_model_config(template: Path, output: Path) -> None:
         ),
         "__RECIPE_ENDPOINT_HOST__": ("RECIPE_ENDPOINT_HOST", None, False),
         "__RECIPE_ENDPOINT_PORT__": ("RECIPE_ENDPOINT_PORT", None, True),
-        "__RECIPE_AISBENCH_MAX_OUT_LEN__": (
-            "RECIPE_AISBENCH_MAX_OUT_LEN",
-            "512",
-            True,
-        ),
     }
     content = template.read_text(encoding="utf-8")
     for placeholder, (name, default, numeric) in substitutions.items():
@@ -87,135 +72,147 @@ def render_model_config(template: Path, output: Path) -> None:
 
 
 def preflight(args: argparse.Namespace) -> None:
+    """Check plan-owned inputs; installation is verified by the CI prepare step."""
     command = shutil.which(args.command) if "/" not in args.command else args.command
-    if not command or not Path(command).is_file():
+    if (
+        not command
+        or not Path(command).is_file()
+        or not os.access(command, os.X_OK)
+    ):
         raise RuntimeError(f"AISBench command not found: {args.command}")
-    subprocess.run(
-        [str(command), "-h"],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-        timeout=30,
-    )
     if not args.model_config.is_file():
         raise RuntimeError(f"AISBench model config not found: {args.model_config}")
-    for name in (
-        "RECIPE_ENDPOINT_HOST",
-        "RECIPE_ENDPOINT_PORT",
-        "RECIPE_MODEL_PATH",
-        "RECIPE_SERVED_MODEL_NAME",
-    ):
-        if not os.environ.get(name):
-            raise RuntimeError(f"required environment variable is missing: {name}")
-    runpy.run_path(str(args.model_config))
     if not args.dataset_directory.is_dir():
         raise RuntimeError(
             f"AISBench dataset directory not found: {args.dataset_directory}"
         )
     args.artifact_directory.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=args.artifact_directory):
-        pass
+
+
+def _latest_run(directory: Path) -> Path:
+    output_root = directory / "outputs/default"
+    runs = (
+        [path for path in output_root.iterdir() if path.is_dir()]
+        if output_root.is_dir()
+        else []
+    )
+    if not runs:
+        raise RuntimeError(f"AISBench run directory not found under {output_root}")
+    return max(runs, key=lambda path: path.stat().st_mtime)
+
+
+def _latest_file(directory: Path, pattern: str, label: str) -> Path:
+    files = list(directory.glob(pattern))
+    if not files:
+        raise RuntimeError(f"AISBench {label} not found under {directory}")
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
+def _number_with_unit(value: object, unit: str, field: str) -> float:
+    if not isinstance(value, str) or not value.endswith(unit):
+        raise RuntimeError(f"invalid AISBench {field}: {value!r}")
+    try:
+        return float(value.removesuffix(unit))
+    except ValueError as error:
+        raise RuntimeError(f"invalid AISBench {field}: {value!r}") from error
 
 
 def accuracy_score(directory: Path) -> tuple[float, Path]:
-    standard_columns = {"dataset", "version", "metric", "mode", "total_count"}
-    for path in newest_files(directory, ".csv"):
-        with path.open(newline="", encoding="utf-8-sig") as input_file:
-            for row in csv.DictReader(input_file):
-                if str(row.get("metric", "")).lower() != "accuracy":
-                    continue
-                for column, value in row.items():
-                    if column not in standard_columns and value not in (None, ""):
-                        try:
-                            return float(value), path
-                        except ValueError:
-                            continue
-    raise RuntimeError(f"no accuracy metric found under {directory}")
+    """Read the fixed AISBench 3.1 summary CSV contract."""
+    summary_directory = _latest_run(directory) / "summary"
+    path = _latest_file(summary_directory, "summary_*.csv", "summary CSV")
+    with path.open(newline="", encoding="utf-8-sig") as input_file:
+        reader = csv.DictReader(input_file)
+        fields = reader.fieldnames or []
+        prefix = ["dataset", "version", "metric", "mode"]
+        if fields[:4] != prefix:
+            raise RuntimeError(f"invalid AISBench accuracy columns in {path}")
+        score_fields = fields[4:]
+        if score_fields and score_fields[0] == "total_count":
+            score_fields = score_fields[1:]
+        if len(score_fields) != 1:
+            raise RuntimeError(f"expected one AISBench model column in {path}")
+        rows = [row for row in reader if row["metric"] == "accuracy"]
 
-
-def flatten_json(value: Any, prefix: str = "") -> Iterable[tuple[str, Any]]:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            name = f"{prefix}.{key}" if prefix else str(key)
-            yield from flatten_json(item, name)
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            yield from flatten_json(item, f"{prefix}[{index}]")
-    else:
-        yield prefix, value
-
-
-def number(value: Any) -> float | None:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    if isinstance(value, str):
-        token = value.strip().split()[0].replace(",", "") if value.strip() else ""
-        try:
-            return float(token)
-        except ValueError:
-            return None
-    return None
+    if len(rows) != 1:
+        raise RuntimeError(f"expected one AISBench accuracy row in {path}")
+    value = rows[0][score_fields[0]]
+    match = (
+        re.fullmatch(
+            r"(-?(?:\d+(?:\.\d*)?|\.\d+))(?: \(\d+/\d+\))?", value
+        )
+        if value is not None
+        else None
+    )
+    if match is None:
+        raise RuntimeError(f"invalid AISBench accuracy score in {path}: {value!r}")
+    return float(match.group(1)), path
 
 
 def performance_metrics(directory: Path) -> tuple[dict[str, float], list[Path]]:
-    metrics: dict[str, float] = {}
-    sources: list[Path] = []
-    aliases = {
-        "request throughput": "request_per_second",
-        "output token throughput": "output_token_per_second",
-        "e2e latency": "e2e_latency_ms",
-        "e2el": "e2e_latency_ms",
-        "ttft": "ttft_ms",
-        "tpot": "tpot_ms",
-    }
-
-    for path in newest_files(directory, ".json"):
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        found = False
-        for key, raw_value in flatten_json(value):
-            lowered = key.lower()
-            for phrase, metric_name in aliases.items():
-                if phrase in lowered and (parsed := number(raw_value)) is not None:
-                    metrics.setdefault(metric_name, parsed)
-                    found = True
-        if found:
-            sources.append(path)
-
-    for path in newest_files(directory, ".csv"):
-        try:
-            with path.open(newline="", encoding="utf-8-sig") as input_file:
-                rows = list(csv.DictReader(input_file))
-        except (OSError, csv.Error):
-            continue
-        found = False
-        for row in rows:
-            parameter = str(row.get("Performance Parameters", "")).lower()
-            average = number(row.get("Average"))
-            if average is None:
-                continue
-            for phrase, metric_name in aliases.items():
-                if phrase in parameter:
-                    metrics.setdefault(metric_name, average)
-                    found = True
-        if found:
-            sources.append(path)
-
-    required = {
-        "request_per_second",
-        "output_token_per_second",
-        "e2e_latency_ms",
-        "ttft_ms",
-        "tpot_ms",
-    }
-    missing = sorted(required - set(metrics))
-    if missing:
+    """Read the fixed AISBench 3.1 default_perf JSON/CSV pair."""
+    performance_root = _latest_run(directory) / "performances"
+    json_files = list(performance_root.glob("*/*.json"))
+    if len(json_files) != 1:
         raise RuntimeError(
-            f"performance metrics missing under {directory}: {', '.join(missing)}"
+            f"expected one AISBench performance JSON under {performance_root}"
         )
-    return metrics, list(dict.fromkeys(sources))
+    json_path = json_files[0]
+    csv_path = json_path.with_suffix(".csv")
+    if not csv_path.is_file():
+        raise RuntimeError(f"AISBench performance CSV not found: {csv_path}")
+
+    try:
+        value = json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"invalid AISBench performance JSON: {json_path}") from error
+    try:
+        request_rate = value["Request Throughput"]["total"]
+        output_rate = value["Output Token Throughput"]["total"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError(f"invalid AISBench performance JSON: {json_path}") from error
+
+    expected_columns = [
+        "Performance Parameters",
+        "Stage",
+        "Average",
+        "Min",
+        "Max",
+        "Median",
+        "P75",
+        "P90",
+        "P99",
+        "N",
+    ]
+    with csv_path.open(newline="", encoding="utf-8-sig") as input_file:
+        reader = csv.DictReader(input_file)
+        if reader.fieldnames != expected_columns:
+            raise RuntimeError(f"invalid AISBench performance columns in {csv_path}")
+        rows = {
+            row["Performance Parameters"]: row
+            for row in reader
+            if row["Stage"] == "total"
+        }
+
+    try:
+        e2el = rows["E2EL"]["Average"]
+        ttft = rows["TTFT"]["Average"]
+        tpot = rows["TPOT"]["Average"]
+    except KeyError as error:
+        raise RuntimeError(f"invalid AISBench performance CSV: {csv_path}") from error
+
+    metrics = {
+        "request_per_second": _number_with_unit(
+            request_rate, " req/s", "Request Throughput.total"
+        ),
+        "output_token_per_second": _number_with_unit(
+            output_rate, " token/s", "Output Token Throughput.total"
+        ),
+        "e2e_latency_ms": _number_with_unit(e2el, " ms", "E2EL.Average"),
+        "ttft_ms": _number_with_unit(ttft, " ms", "TTFT.Average"),
+        "tpot_ms": _number_with_unit(tpot, " ms", "TPOT.Average"),
+    }
+    return metrics, [json_path, csv_path]
 
 
 def relative_artifacts(paths: Iterable[Path], root: Path) -> list[str]:
@@ -271,7 +268,7 @@ def main() -> int:
             },
         )
         return 0
-    except (OSError, RuntimeError, subprocess.SubprocessError, ImportError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 

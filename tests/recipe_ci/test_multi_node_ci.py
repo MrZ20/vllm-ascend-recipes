@@ -115,26 +115,30 @@ class PlanTests(unittest.TestCase):
             self.assertIn("render-model-config", accuracy_script)
             self.assertIn("render-model-config", performance_script)
 
-    def test_lightweight_plan_carries_an_offline_gsm8k_fixture(self) -> None:
-        dataset = EXAMPLE / "aisbench/datasets/gsm8k"
-        train_rows = [
-            json.loads(line)
-            for line in (dataset / "train.jsonl").read_text().splitlines()
-        ]
-        test_rows = [
-            json.loads(line)
-            for line in (dataset / "test.jsonl").read_text().splitlines()
-        ]
+    def test_small_plans_carry_isolated_offline_gsm8k_fixtures(self) -> None:
+        for example in (EXAMPLE, GENERIC_DP_EXAMPLE):
+            dataset = example / "aisbench/datasets/gsm8k"
+            train_rows = [
+                json.loads(line)
+                for line in (dataset / "train.jsonl").read_text().splitlines()
+            ]
+            test_rows = [
+                json.loads(line)
+                for line in (dataset / "test.jsonl").read_text().splitlines()
+            ]
 
-        self.assertGreaterEqual(len(train_rows), 1)
-        self.assertEqual(len(test_rows), 8)
-        for row in [*train_rows, *test_rows]:
-            self.assertEqual(set(row), {"question", "answer"})
-            self.assertIn("#### ", row["answer"])
+            self.assertGreaterEqual(len(train_rows), 1)
+            self.assertEqual(len(test_rows), 8)
+            for row in [*train_rows, *test_rows]:
+                self.assertEqual(set(row), {"question", "answer"})
+                self.assertIn("#### ", row["answer"])
 
-        for script_name in ("accuracy.sh", "performance.sh"):
-            script = (EXAMPLE / "evaluations" / script_name).read_text()
-            self.assertIn("prepare_gsm8k.sh", script)
+            prepare = (example / "evaluations/prepare_gsm8k.sh").read_text()
+            self.assertIn("$RECIPE_STEP_ARTIFACT_DIR/ais_bench", prepare)
+            self.assertNotIn("$RECIPE_AISBENCH_ROOT/ais_bench", prepare)
+            for script_name in ("accuracy.sh", "performance.sh"):
+                script = (example / "evaluations" / script_name).read_text()
+                self.assertIn("prepare_gsm8k.sh", script)
 
     def test_hosts_must_match_plan_nodes(self) -> None:
         plan = load_plan(EXAMPLE / "plan.yaml")
@@ -172,7 +176,7 @@ class PlanTests(unittest.TestCase):
             environment.update(
                 {
                     "PATH": f"{fake_bin}:{environment['PATH']}",
-                    "ASCEND_RT_VISIBLE_DEVICES": "4,5,6,7",
+                    "RECIPE_CI_VISIBLE_DEVICES": "4,5,6,7",
                     "RECIPE_MODEL_PATH": "/models/fake",
                     "RECIPE_SERVED_MODEL_NAME": "fake",
                 }
@@ -320,14 +324,11 @@ class LocalRunnerTests(unittest.TestCase):
             )
             leader_output, _ = leader.communicate(timeout=30)
             worker_output, _ = worker.communicate(timeout=30)
-            worker_log = (
-                artifact_root / "local-runner-test/node1/service.log"
-            ).read_text(encoding="utf-8")
 
             self.assertEqual(
                 leader.returncode,
                 0,
-                f"{leader_output}\nworker output:\n{worker_output}\nworker log:\n{worker_log}",
+                f"{leader_output}\nworker output:\n{worker_output}",
             )
             self.assertEqual(worker.returncode, 0, worker_output)
             self.assertIn("local service ready", leader_output)
@@ -337,7 +338,9 @@ class LocalRunnerTests(unittest.TestCase):
             leader_artifacts = artifact_root / "local-runner-test" / "node0"
             self.assertTrue((leader_artifacts / "checks/health.log").is_file())
             self.assertEqual(
-                (leader_artifacts / "accuracy/result.txt").read_text(encoding="utf-8"),
+                (leader_artifacts / "accuracy/accuracy/result.txt").read_text(
+                    encoding="utf-8"
+                ),
                 f"127.0.0.1:{gateway_port}\n",
             )
             final_result = json.loads(
@@ -356,6 +359,13 @@ class LocalRunnerTests(unittest.TestCase):
             )
             self.assertEqual(final_result["status"], "passed")
             self.assertEqual(
+                {
+                    node_id: result["status"]
+                    for node_id, result in final_result["nodes"].items()
+                },
+                {"node0": "passed", "node1": "passed"},
+            )
+            self.assertEqual(
                 final_result["evaluations"]["accuracy"]["accuracy"]["metrics"][
                     "accuracy"
                 ],
@@ -369,8 +379,17 @@ class LocalRunnerTests(unittest.TestCase):
             )
             self.assertEqual(leader_result["status"], "passed")
             self.assertEqual(worker_result["status"], "passed")
-            self.assertIsNotNone(leader_result["cleaned_at"])
-            self.assertIsNotNone(worker_result["cleaned_at"])
+            self.assertEqual(
+                set(leader_result),
+                {
+                    "schema_version",
+                    "node_id",
+                    "status",
+                    "failure",
+                    "cleanup_errors",
+                },
+            )
+            self.assertEqual(set(worker_result), set(leader_result))
 
     def test_remote_service_failure_interrupts_a_supervised_check(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -518,7 +537,7 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
         )
         (plan_dir / "evaluations/accuracy.sh").write_text(
             'echo "$RECIPE_ENDPOINT_HOST:$RECIPE_ENDPOINT_PORT" '
-            '> "$RECIPE_ARTIFACT_DIR/result.txt"\n'
+            '> "$RECIPE_STEP_ARTIFACT_DIR/result.txt"\n'
             "printf '%s\\n' '{\"status\": \"passed\", \"type\": \"accuracy\", "
             "\"metrics\": {\"accuracy\": 1.0}}' > \"$RECIPE_STEP_RESULT_FILE\"\n",
             encoding="utf-8",

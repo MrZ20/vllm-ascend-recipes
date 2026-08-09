@@ -116,9 +116,6 @@ export RECIPE_CI_CLUSTER_IPS
     done
 } > "$hosts_file"
 
-if command -v npu-smi >/dev/null 2>&1; then
-    npu-smi info
-fi
 if [[ -z "${RECIPE_CI_VISIBLE_DEVICES:-}" ]]; then
     if [[ -n "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
         export RECIPE_CI_VISIBLE_DEVICES=$ASCEND_RT_VISIBLE_DEVICES
@@ -127,7 +124,6 @@ if [[ -z "${RECIPE_CI_VISIBLE_DEVICES:-}" ]]; then
     fi
 fi
 echo "Recipe CI node: index=$LWS_WORKER_INDEX id=$node_id ip=${cluster_ips[$LWS_WORKER_INDEX]}"
-echo "Recipe CI visible devices: ${RECIPE_CI_VISIBLE_DEVICES:-container default}"
 
 if [[ "${RECIPE_CI_INSTALL_MOONCAKE:-false}" == "true" ]]; then
     mooncake_lib_dir=$("$SCRIPT_DIR/install_mooncake.sh")
@@ -135,20 +131,13 @@ if [[ "${RECIPE_CI_INSTALL_MOONCAKE:-false}" == "true" ]]; then
     echo "Mooncake library path: ${mooncake_lib_dir}"
 fi
 
-if [[ "${RECIPE_CI_INSTALL_AISBENCH:-false}" == "true" && "$node_id" == "node0" ]]; then
-    if ! command -v "${RECIPE_AISBENCH_BIN:-ais_bench}" >/dev/null 2>&1; then
-        "$SCRIPT_DIR/install_aisbench.sh"
-    fi
-fi
-
 artifact_root=${RECIPE_CI_ARTIFACT_ROOT:-/tmp/recipe-ci}
-plog_directory="${RECIPE_CI_PLOG_ROOT:-$artifact_root/plogs}/$node_id"
 # shellcheck disable=SC2329  # Invoked by the EXIT trap.
 collect_plogs() {
-    if [[ -d /root/ascend/log ]]; then
-        mkdir -p "$plog_directory"
-        cp -a /root/ascend/log/. "$plog_directory/" 2>/dev/null || true
-    fi
+    [[ -n "${RECIPE_CI_PLOG_ROOT:-}" && -d /root/ascend/log ]] || return 0
+    plog_directory="$RECIPE_CI_PLOG_ROOT/$node_id"
+    mkdir -p "$plog_directory"
+    cp -a /root/ascend/log/. "$plog_directory/" 2>/dev/null || true
 }
 trap collect_plogs EXIT
 
