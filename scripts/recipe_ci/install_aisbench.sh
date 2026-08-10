@@ -6,6 +6,8 @@ AIS_BENCH_TAG=${AIS_BENCH_TAG:-v3.1-20260609-master}
 AIS_BENCH_EXPECTED_COMMIT=${AIS_BENCH_EXPECTED_COMMIT:-0da56eadb2ac85c31c2540f4f5b69af3ec5717a5}
 AIS_BENCH_URL=${AIS_BENCH_URL:-https://github.com/AISBench/benchmark.git}
 AIS_BENCH_CACHE_ROOT=${AIS_BENCH_CACHE_ROOT:-/root/.cache/recipe-ci/tools/aisbench}
+AIS_BENCH_CACHE_SCHEMA=${AIS_BENCH_CACHE_SCHEMA:-v1}
+AIS_BENCH_ENVIRONMENT_IDENTITY=${AIS_BENCH_ENVIRONMENT_IDENTITY:-}
 AIS_BENCH_PYTHON=${AIS_BENCH_PYTHON:-python3}
 AIS_BENCH_CONSTRAINTS=${AIS_BENCH_CONSTRAINTS:-$SCRIPT_DIR/aisbench-constraints.txt}
 env_file=""
@@ -33,6 +35,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+[[ -n "$AIS_BENCH_ENVIRONMENT_IDENTITY" ]] || {
+    echo "AIS_BENCH_ENVIRONMENT_IDENTITY is required." >&2
+    exit 1
+}
 [[ -f "$AIS_BENCH_CONSTRAINTS" ]] || {
     echo "AISBench constraints not found: $AIS_BENCH_CONSTRAINTS" >&2
     exit 1
@@ -51,7 +57,15 @@ import sys
 print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()[:16])
 PY
 )
-cache_key="${AIS_BENCH_EXPECTED_COMMIT}-py${python_version}-${architecture}-${constraints_hash}"
+environment_hash=$(
+    "$AIS_BENCH_PYTHON" - "$AIS_BENCH_ENVIRONMENT_IDENTITY" <<'PY'
+import hashlib
+import sys
+
+print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])
+PY
+)
+cache_key="${AIS_BENCH_CACHE_SCHEMA}-${AIS_BENCH_EXPECTED_COMMIT}-env${environment_hash}-py${python_version}-${architecture}-${constraints_hash}"
 cache_directory="${AIS_BENCH_CACHE_ROOT}/${cache_key}"
 source_directory="${cache_directory}/source"
 venv_directory="${cache_directory}/venv"
@@ -79,7 +93,6 @@ write_environment() {
     [[ -n "$env_file" ]] || return 0
     mkdir -p "$(dirname -- "$env_file")"
     {
-        printf 'RECIPE_AISBENCH_ROOT=%s\n' "$source_directory"
         printf 'RECIPE_AISBENCH_BIN=%s\n' "$command_path"
         printf 'RECIPE_AISBENCH_CACHE_KEY=%s\n' "$cache_key"
     } > "$env_file"
@@ -131,8 +144,9 @@ if [[ "$actual_commit" != "$AIS_BENCH_EXPECTED_COMMIT" ]]; then
     exit 1
 fi
 
-# Reuse the fixed runtime image's large framework dependencies while keeping
-# AISBench itself and any missing packages in the immutable cache directory.
+# Reuse the preparation image's large framework dependencies while keeping
+# AISBench in the cache. The cache identity binds both preparation and runtime
+# image references because this venv is later consumed inside the LWS image.
 "$AIS_BENCH_PYTHON" -m venv --system-site-packages "$staging_directory/venv"
 "$staging_directory/venv/bin/python" -m pip install \
     --constraint "$AIS_BENCH_CONSTRAINTS" \
@@ -160,9 +174,4 @@ mv "$staging_directory" "$cache_directory"
 staging_directory=""
 write_environment
 
-echo "AISBench prepared successfully."
-echo "  tag:    $AIS_BENCH_TAG"
-echo "  commit: $AIS_BENCH_EXPECTED_COMMIT"
-echo "  cache:  $cache_directory"
-echo "  source: $source_directory"
-echo "  bin:    $command_path"
+echo "AISBench prepared: $cache_directory"

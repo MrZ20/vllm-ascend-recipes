@@ -18,6 +18,7 @@ jobs:
       matrix:
         plan:
           - configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml
+          - configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml
     uses: ./.github/workflows/_recipe_verify_multi_node.yaml
     with:
       plan: ${{ matrix.plan }}

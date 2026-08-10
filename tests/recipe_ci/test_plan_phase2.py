@@ -70,29 +70,41 @@ class PlanTests(unittest.TestCase):
                 "port": 38085,
                 "health_path": "/healthcheck",
             },
-            "checks": [
+            "stages": [
                 {
                     "id": "completion",
-                    "script": "checks/completion.sh",
-                    "timeout_seconds": 300,
-                }
+                    "failure_category": "check_failed",
+                    "steps": [
+                        {
+                            "id": "completion",
+                            "script": "checks/completion.sh",
+                            "timeout_seconds": 300,
+                        }
+                    ],
+                },
+                {
+                    "id": "accuracy",
+                    "failure_category": "evaluation_failed",
+                    "steps": [
+                        {
+                            "id": "accuracy",
+                            "script": "evaluations/accuracy.sh",
+                            "timeout_seconds": 600,
+                        }
+                    ],
+                },
+                {
+                    "id": "performance",
+                    "failure_category": "evaluation_failed",
+                    "steps": [
+                        {
+                            "id": "performance",
+                            "script": "evaluations/performance.sh",
+                            "timeout_seconds": 900,
+                        }
+                    ],
+                },
             ],
-            "evaluations": {
-                "accuracy": [
-                    {
-                        "id": "accuracy",
-                        "script": "evaluations/accuracy.sh",
-                        "timeout_seconds": 600,
-                    }
-                ],
-                "performance": [
-                    {
-                        "id": "performance",
-                        "script": "evaluations/performance.sh",
-                        "timeout_seconds": 900,
-                    }
-                ],
-            },
         }
         self.hosts_data = {
             "version": 1,
@@ -134,86 +146,28 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan.nodes[0].readiness.count, 2)
         self.assertEqual(plan.nodes[1].readiness.count, 1)
         self.assertEqual(plan.gateway.port, 38085)
-        self.assertEqual(plan.checks[0].timeout_seconds, 300)
-        self.assertEqual(plan.evaluations.accuracy[0].timeout_seconds, 600)
-
-    def test_required_fields_and_container_types_are_checked(self) -> None:
-        cases = []
-        missing_nodes = copy.deepcopy(self.plan_data)
-        del missing_nodes["nodes"]
-        cases.append((missing_nodes, "plan is missing fields: nodes"))
-        invalid_model = copy.deepcopy(self.plan_data)
-        invalid_model["model"] = []
-        cases.append((invalid_model, "model must be a mapping"))
-        invalid_nodes = copy.deepcopy(self.plan_data)
-        invalid_nodes["nodes"] = {}
-        cases.append((invalid_nodes, "nodes must contain at least two"))
-        invalid_checks = copy.deepcopy(self.plan_data)
-        invalid_checks["checks"] = {}
-        cases.append((invalid_checks, "checks must be a list"))
-
-        for data, message in cases:
-            with self.subTest(message=message), self.assertRaisesRegex(
-                PlanError, message
-            ):
-                load_plan(self.write_plan(data))
-
-    def test_nodes_are_ordered_and_use_independent_existing_scripts(self) -> None:
-        one_node = copy.deepcopy(self.plan_data)
-        one_node["nodes"] = one_node["nodes"][:1]
-        with self.assertRaisesRegex(PlanError, "at least two"):
-            load_plan(self.write_plan(one_node))
-
-        wrong_id = copy.deepcopy(self.plan_data)
-        wrong_id["nodes"][1]["id"] = "node2"
-        with self.assertRaisesRegex(PlanError, r"nodes\[1\]\.id must be node1"):
-            load_plan(self.write_plan(wrong_id))
-
-        shared_script = copy.deepcopy(self.plan_data)
-        shared_script["nodes"][1]["launch"] = "nodes/node0/run.sh"
-        with self.assertRaisesRegex(PlanError, "each node must have its own"):
-            load_plan(self.write_plan(shared_script))
-
-        missing_script = copy.deepcopy(self.plan_data)
-        missing_script["gateway"]["launch"] = "gateway/missing.sh"
-        with self.assertRaisesRegex(PlanError, r"gateway\.launch does not exist"):
-            load_plan(self.write_plan(missing_script))
-
-    def test_integer_and_port_values_must_be_executable(self) -> None:
-        cases = []
-        invalid_npu = copy.deepcopy(self.plan_data)
-        invalid_npu["resources"]["npu_per_node"] = 0
-        cases.append((invalid_npu, r"resources\.npu_per_node"))
-        invalid_timeout = copy.deepcopy(self.plan_data)
-        invalid_timeout["checks"][0]["timeout_seconds"] = True
-        cases.append((invalid_timeout, r"checks\[0\]\.timeout_seconds"))
-        invalid_port = copy.deepcopy(self.plan_data)
-        invalid_port["nodes"][0]["readiness"]["port_start"] = 65536
-        cases.append((invalid_port, r"readiness\.port_start"))
-        overflow = copy.deepcopy(self.plan_data)
-        overflow["nodes"][0]["readiness"].update(
-            {"port_start": 65535, "count": 2}
+        self.assertEqual(
+            [stage.id for stage in plan.stages],
+            ["completion", "accuracy", "performance"],
         )
-        cases.append((overflow, "port range exceeds"))
+        self.assertEqual(plan.stages[0].failure_category, "check_failed")
+        self.assertEqual(plan.stages[1].steps[0].timeout_seconds, 600)
 
-        for data, message in cases:
-            with self.subTest(message=message), self.assertRaisesRegex(
-                PlanError, message
-            ):
-                load_plan(self.write_plan(data))
+    def test_loader_trusts_converter_validated_topology_and_paths(self) -> None:
+        data = copy.deepcopy(self.plan_data)
+        data["nodes"][1]["id"] = "worker-b"
+        data["nodes"][1]["launch"] = "nodes/generated-at-runtime.sh"
+        data["stages"][0]["failure_category"] = "custom_failure"
+        data["stages"][0]["steps"][0]["script"] = "generated/check.sh"
 
-    def test_gateway_and_leader_readiness_define_one_endpoint(self) -> None:
-        conflict = copy.deepcopy(self.plan_data)
-        conflict["gateway"]["port"] = 7101
-        with self.assertRaisesRegex(PlanError, "conflicts with leader readiness"):
-            load_plan(self.write_plan(conflict))
+        plan = load_plan(self.write_plan(data))
 
-        no_endpoint = copy.deepcopy(self.plan_data)
-        del no_endpoint["gateway"]
-        del no_endpoint["nodes"][0]["readiness"]
-        with self.assertRaisesRegex(PlanError, "leader needs HTTP readiness"):
-            load_plan(self.write_plan(no_endpoint))
+        self.assertEqual(plan.nodes[1].id, "worker-b")
+        self.assertEqual(plan.nodes[1].launch, "nodes/generated-at-runtime.sh")
+        self.assertEqual(plan.stages[0].failure_category, "custom_failure")
+        self.assertEqual(plan.stages[0].steps[0].script, "generated/check.sh")
 
+    def test_gateway_and_leader_readiness_define_the_runtime_endpoint(self) -> None:
         direct = copy.deepcopy(self.plan_data)
         del direct["gateway"]
         plan = load_plan(self.write_plan(direct))
@@ -228,6 +182,9 @@ class PlanTests(unittest.TestCase):
         hosts = load_hosts(self.write_hosts(), plan)
         self.assertEqual(hosts["node0"].interface, "eth0")
         self.assertIsNone(hosts["node1"].interface)
+        self.assertEqual(plan.node("node1").index, 1)
+        with self.assertRaisesRegex(PlanError, "Unknown node: node2"):
+            plan.node("node2")
 
         missing = copy.deepcopy(self.hosts_data)
         del missing["hosts"]["node1"]
@@ -255,7 +212,7 @@ class PlanTests(unittest.TestCase):
             summary,
         )
         self.assertIn("Gateway: gateway/run.sh port=38085", summary)
-        self.assertIn("Steps: checks=1, accuracy=1, performance=1", summary)
+        self.assertIn("Stages: completion=1, accuracy=1, performance=1", summary)
 
 
 if __name__ == "__main__":

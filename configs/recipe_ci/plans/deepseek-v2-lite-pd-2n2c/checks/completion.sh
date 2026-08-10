@@ -7,3 +7,4 @@ response=$(curl --fail --silent --show-error \
     -d "{\"model\":\"$RECIPE_SERVED_MODEL_NAME\",\"prompt\":\"The future of AI is\",\"max_tokens\":50,\"temperature\":0}")
 
 python3 -c 'import json, sys; assert json.load(sys.stdin)["choices"]' <<<"$response"
+printf '%s\n' '{"status":"passed"}' > "$RECIPE_STEP_RESULT_FILE"

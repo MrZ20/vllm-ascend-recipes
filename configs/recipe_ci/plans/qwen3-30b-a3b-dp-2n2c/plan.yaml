@@ -23,17 +23,22 @@ nodes:
     role: headless
     launch: nodes/node1/run.sh
 
-checks:
+stages:
   - id: completion
-    script: checks/completion.sh
-    timeout_seconds: 300
-
-evaluations:
-  accuracy:
-    - id: gsm8k
-      script: evaluations/accuracy.sh
-      timeout_seconds: 7200
-  performance:
-    - id: gsm8k-perf
-      script: evaluations/performance.sh
-      timeout_seconds: 7200
+    failure_category: check_failed
+    steps:
+      - id: completion
+        script: checks/completion.sh
+        timeout_seconds: 300
+  - id: accuracy
+    failure_category: evaluation_failed
+    steps:
+      - id: gsm8k
+        script: evaluations/accuracy.sh
+        timeout_seconds: 7200
+  - id: performance
+    failure_category: evaluation_failed
+    steps:
+      - id: gsm8k-perf
+        script: evaluations/performance.sh
+        timeout_seconds: 7200

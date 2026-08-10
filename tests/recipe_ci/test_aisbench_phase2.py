@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import runpy
@@ -18,41 +17,11 @@ sys.path.insert(0, str(ROOT))
 from scripts.recipe_ci.aisbench import (  # noqa: E402
     accuracy_score,
     performance_metrics,
-    preflight,
     render_model_config,
 )
 
 
 class AisbenchResultTests(unittest.TestCase):
-    def test_preflight_checks_command_config_dataset_and_environment(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            command = root / "ais_bench"
-            command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            command.chmod(0o755)
-            config = root / "model.py"
-            config.write_text("models = []\n", encoding="utf-8")
-            dataset = root / "dataset"
-            dataset.mkdir()
-            artifact = root / "artifact"
-            args = argparse.Namespace(
-                command=str(command),
-                model_config=config,
-                dataset_directory=dataset,
-                artifact_directory=artifact,
-            )
-            environment = {
-                "RECIPE_ENDPOINT_HOST": "127.0.0.1",
-                "RECIPE_ENDPOINT_PORT": "8000",
-                "RECIPE_MODEL_PATH": "/models/fake",
-                "RECIPE_SERVED_MODEL_NAME": "fake",
-            }
-
-            with mock.patch.dict(os.environ, environment, clear=False):
-                preflight(args)
-
-            self.assertTrue(artifact.is_dir())
-
     def test_model_config_template_is_rendered_with_runtime_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

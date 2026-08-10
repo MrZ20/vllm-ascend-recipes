@@ -9,10 +9,13 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable
+from typing import Any, Callable, Mapping
+
+from scripts.recipe_ci.result import NodeOutcome, RunOutcome, StopSignal
 
 
 RUNNING = "running"
+STOPPING = "stopping"
 
 
 class CoordinatorError(RuntimeError):
@@ -21,79 +24,132 @@ class CoordinatorError(RuntimeError):
         self.code = code
 
 
+class ObservedGlobalStop(RuntimeError):
+    """Control flow for a stop initiated by this node's peer."""
+
+    def __init__(self, signal: StopSignal) -> None:
+        self.signal = signal
+        message = signal.failure.message if signal.failure else signal.kind
+        super().__init__(f"{signal.origin_node_id}: {message}")
+
+
 class RunState:
+    """Thread-safe transport state; final node outcomes are immutable."""
+
     def __init__(self, node_ids: list[str]) -> None:
-        self.nodes = {node_id: "pending" for node_id in node_ids}
-        self.failures: dict[str, str] = {}
-        self.cleaned: set[str] = set()
-        self.status = RUNNING
-        self.message = ""
+        if not node_ids or len(set(node_ids)) != len(node_ids):
+            raise ValueError("node_ids must be unique and non-empty")
+        self.node_ids = tuple(node_ids)
+        self.readiness = {node_id: "pending" for node_id in node_ids}
+        self.stop_signal: StopSignal | None = None
+        self.outcomes: dict[str, NodeOutcome] = {}
+        self.final_outcome: RunOutcome | None = None
         self.condition = threading.Condition()
 
     def mark_ready(self, node_id: str) -> None:
         with self.condition:
-            status = self._node_status(node_id)
+            status = self._readiness(node_id)
             if status == "ready":
                 return
-            if self.status != RUNNING or status != "pending":
-                raise CoordinatorError(f"node {node_id} cannot become ready")
-            self.nodes[node_id] = "ready"
+            if self.stop_signal is not None:
+                raise CoordinatorError(f"node {node_id} cannot become ready after stop")
+            self.readiness[node_id] = "ready"
             self.condition.notify_all()
 
-    def mark_failed(self, node_id: str, message: str) -> None:
+    def request_stop(self, signal: StopSignal) -> None:
         with self.condition:
-            self._node_status(node_id)
-            if node_id in self.failures:
-                return
-            if self.status in {"passed", "cancelled"}:
-                raise CoordinatorError(f"run is already {self.status}")
-            self.nodes[node_id] = "failed"
-            self.failures[node_id] = message
-            if self.status == RUNNING:
-                self.status = "failed"
-                self.message = f"{node_id}: {message}"
+            self._readiness(signal.origin_node_id)
+            if self.stop_signal is not None:
+                if self.stop_signal == signal:
+                    return
+                raise CoordinatorError("run already has a different stop signal")
+            if self.final_outcome is not None:
+                raise CoordinatorError("run is already finalized")
+            if signal.kind == "completed" and any(
+                status != "ready" for status in self.readiness.values()
+            ):
+                raise CoordinatorError("execution cannot complete before all nodes are ready")
+            self.stop_signal = signal
             self.condition.notify_all()
 
-    def mark_cleaned(self, node_id: str) -> None:
+    def report_outcome(self, outcome: NodeOutcome) -> None:
         with self.condition:
-            self._node_status(node_id)
-            self.cleaned.add(node_id)
-            self.condition.notify_all()
-
-    def finish(self, status: str, message: str = "") -> None:
-        with self.condition:
-            if status not in {"passed", "cancelled"}:
-                raise CoordinatorError(f"invalid terminal status: {status}")
-            if self.status == status:
-                return
-            if self.status != RUNNING:
+            self._readiness(outcome.node_id)
+            previous = self.outcomes.get(outcome.node_id)
+            if previous is not None:
+                if previous == outcome:
+                    return
                 raise CoordinatorError(
-                    f"run is already {self.status}; cannot finish as {status}"
+                    f"node {outcome.node_id} already reported a different outcome"
                 )
-            self.status = status
-            self.message = message
-            for node_id, node_status in self.nodes.items():
-                if status == "passed" and node_status == "ready":
-                    self.nodes[node_id] = "passed"
-                elif status == "cancelled" and node_status != "failed":
-                    self.nodes[node_id] = "cancelled"
+            if self.stop_signal is None:
+                raise CoordinatorError("node outcome cannot be reported before stop")
+            if self.final_outcome is not None:
+                raise CoordinatorError("run is already finalized")
+            self._validate_origin_outcome(outcome)
+            self.outcomes[outcome.node_id] = outcome
+            self.condition.notify_all()
+
+    def finalize(self, outcome: RunOutcome) -> None:
+        with self.condition:
+            if self.final_outcome is not None:
+                if self.final_outcome == outcome:
+                    return
+                raise CoordinatorError("run already has a different final outcome")
+            if self.stop_signal is None:
+                raise CoordinatorError("run cannot finalize before stop")
+            if dict(outcome.nodes) != self.outcomes:
+                raise CoordinatorError("final outcome does not match reported node outcomes")
+            missing = set(self.node_ids) - self.outcomes.keys()
+            if set(outcome.missing_nodes) != missing:
+                raise CoordinatorError("final outcome does not identify missing nodes")
+            self.final_outcome = outcome
             self.condition.notify_all()
 
     def snapshot(self) -> dict[str, object]:
         with self.condition:
+            if self.final_outcome is not None:
+                status = self.final_outcome.status
+            elif self.stop_signal is not None:
+                status = STOPPING
+            else:
+                status = RUNNING
             return {
-                "status": self.status,
-                "message": self.message,
-                "nodes": dict(sorted(self.nodes.items())),
-                "failures": dict(sorted(self.failures.items())),
-                "cleaned": sorted(self.cleaned),
+                "status": status,
+                "readiness": dict(sorted(self.readiness.items())),
+                "stop_signal": (
+                    self.stop_signal.to_dict() if self.stop_signal else None
+                ),
+                "outcomes": {
+                    node_id: outcome.to_dict()
+                    for node_id, outcome in sorted(self.outcomes.items())
+                },
+                "final_outcome": (
+                    self.final_outcome.to_dict() if self.final_outcome else None
+                ),
             }
 
-    def _node_status(self, node_id: str) -> str:
+    def _readiness(self, node_id: str) -> str:
         try:
-            return self.nodes[node_id]
+            return self.readiness[node_id]
         except KeyError as error:
             raise CoordinatorError(f"unknown node: {node_id}") from error
+
+    def _validate_origin_outcome(self, outcome: NodeOutcome) -> None:
+        signal = self.stop_signal
+        if signal is None or signal.origin_node_id != outcome.node_id:
+            return
+        expected_status = {
+            "completed": "passed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+        }[signal.kind]
+        if outcome.execution_status != expected_status:
+            raise CoordinatorError(
+                f"stop origin {outcome.node_id} must report {expected_status} execution"
+            )
+        if signal.failure != outcome.failure:
+            raise CoordinatorError("stop origin outcome does not match its stop failure")
 
 
 def _handler(state: RunState) -> type[BaseHTTPRequestHandler]:
@@ -106,34 +162,48 @@ def _handler(state: RunState) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             parts = self.path.strip("/").split("/")
-            if len(parts) != 3 or parts[0] != "nodes":
-                self._send(404, {"error": "endpoint not found"})
-                return
-            node_id, action = parts[1:]
             try:
-                if action == "ready":
-                    state.mark_ready(node_id)
-                elif action == "failed":
-                    state.mark_failed(node_id, self._failure_message())
-                elif action == "cleaned":
-                    state.mark_cleaned(node_id)
+                if len(parts) == 3 and parts[0] == "nodes":
+                    node_id, action = parts[1:]
+                    if action == "ready":
+                        self._body_object(allow_empty=True)
+                        state.mark_ready(node_id)
+                    elif action == "stop":
+                        signal = StopSignal.from_dict(self._body_object())
+                        if signal.origin_node_id != node_id:
+                            raise CoordinatorError(
+                                "stop signal origin does not match request node"
+                            )
+                        state.request_stop(signal)
+                    elif action == "outcome":
+                        outcome = NodeOutcome.from_dict(self._body_object())
+                        if outcome.node_id != node_id:
+                            raise CoordinatorError(
+                                "node outcome id does not match request node"
+                            )
+                        state.report_outcome(outcome)
+                    else:
+                        self._send(404, {"error": "endpoint not found"})
+                        return
                 else:
                     self._send(404, {"error": "endpoint not found"})
                     return
-            except CoordinatorError as error:
+            except (CoordinatorError, ValueError) as error:
                 self._send(400, {"error": str(error)})
                 return
             self._send(200, state.snapshot())
 
-        def _failure_message(self) -> str:
+        def _body_object(self, *, allow_empty: bool = False) -> Mapping[str, Any]:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                message = json.loads(self.rfile.read(length))["message"]
-                if not isinstance(message, str) or not message:
+                if length == 0 and allow_empty:
+                    return {}
+                value = json.loads(self.rfile.read(length))
+                if not isinstance(value, dict):
                     raise ValueError
-                return message
-            except (LookupError, TypeError, ValueError) as error:
-                raise CoordinatorError("invalid failure message") from error
+                return value
+            except (TypeError, ValueError) as error:
+                raise CoordinatorError("invalid request body") from error
 
         def _send(self, status: int, value: object) -> None:
             body = json.dumps(value).encode()
@@ -149,47 +219,63 @@ def _handler(state: RunState) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+class _CoordinatorHTTPServer(ThreadingHTTPServer):
+    # Do not let LeaderCoordinator.close() race the last outcome response.
+    daemon_threads = False
+    block_on_close = True
+
+
 class LeaderCoordinator:
     def __init__(
         self, node_ids: list[str], port: int, *, host: str = "0.0.0.0"
     ) -> None:
         self.state = RunState(node_ids)
-        self.server = ThreadingHTTPServer((host, port), _handler(self.state))
+        self.server = _CoordinatorHTTPServer((host, port), _handler(self.state))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.started = False
+        self.closed = False
 
     @property
     def port(self) -> int:
         return int(self.server.server_address[1])
 
     def start(self) -> None:
+        if self.started:
+            return
         self.thread.start()
+        self.started = True
 
     def close(self) -> None:
-        self.server.shutdown()
+        if self.closed:
+            return
+        if self.started:
+            self.server.shutdown()
+            self.thread.join()
         self.server.server_close()
-        self.thread.join()
+        self.closed = True
 
     def wait_ready(self, timeout: int, check_processes: Callable[[], None]) -> None:
         self._wait(
-            lambda: all(status == "ready" for status in self.state.nodes.values()),
+            lambda: all(status == "ready" for status in self.state.readiness.values()),
             timeout,
             "nodes to become ready",
             check_processes,
-            stop_on_terminal=True,
+            stop_on_signal=True,
         )
 
-    def wait_cleaned(self, timeout: int) -> None:
+    def wait_outcomes(self, timeout: int) -> dict[str, NodeOutcome]:
         self._wait(
-            lambda: self.state.cleaned == self.state.nodes.keys(),
+            lambda: self.state.outcomes.keys() == self.state.readiness.keys(),
             timeout,
-            "nodes to report cleanup",
+            "nodes to report final outcomes",
             lambda: None,
         )
+        return dict(self.state.outcomes)
 
-    def raise_if_failed(self) -> None:
+    def raise_if_stopped(self) -> None:
         with self.state.condition:
-            if self.state.status == "failed":
-                raise CoordinatorError(self.state.message)
+            if self.state.stop_signal is not None:
+                raise ObservedGlobalStop(self.state.stop_signal)
 
     def _wait(
         self,
@@ -198,14 +284,14 @@ class LeaderCoordinator:
         description: str,
         check_processes: Callable[[], None],
         *,
-        stop_on_terminal: bool = False,
+        stop_on_signal: bool = False,
     ) -> None:
         deadline = time.monotonic() + timeout
         with self.state.condition:
             while not complete():
                 check_processes()
-                if stop_on_terminal and self.state.status != RUNNING:
-                    raise CoordinatorError(self.state.message or self.state.status)
+                if stop_on_signal and self.state.stop_signal is not None:
+                    raise ObservedGlobalStop(self.state.stop_signal)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CoordinatorError(f"timed out waiting for {description}")
@@ -223,11 +309,15 @@ class CoordinatorClient:
     def mark_ready(self, node_id: str, timeout: int) -> None:
         self._request(f"/nodes/{node_id}/ready", {}, timeout)
 
-    def mark_failed(self, node_id: str, message: str, timeout: int = 5) -> None:
-        self._request(f"/nodes/{node_id}/failed", {"message": message}, timeout)
+    def request_stop(self, signal: StopSignal, timeout: int = 5) -> None:
+        self._request(
+            f"/nodes/{signal.origin_node_id}/stop", signal.to_dict(), timeout
+        )
 
-    def mark_cleaned(self, node_id: str, timeout: int = 5) -> None:
-        self._request(f"/nodes/{node_id}/cleaned", {}, timeout)
+    def report_outcome(self, outcome: NodeOutcome, timeout: int = 5) -> None:
+        self._request(
+            f"/nodes/{outcome.node_id}/outcome", outcome.to_dict(), timeout
+        )
 
     def wait_available(
         self, timeout: int, check_processes: Callable[[], None]
@@ -249,23 +339,29 @@ class CoordinatorClient:
                     raise
             time.sleep(min(1, max(0, deadline - time.monotonic())))
 
-    def wait_terminal(
+    def wait_stop(
         self, timeout: int, check_processes: Callable[[], None]
-    ) -> dict[str, object]:
+    ) -> StopSignal:
         deadline = time.monotonic() + timeout
         while True:
             check_processes()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise CoordinatorError("timed out waiting for the leader result")
+                raise CoordinatorError("timed out waiting for the run stop signal")
             state = self._request("/state", None, remaining)
-            if state["status"] != RUNNING:
-                return state
+            raw_signal = state.get("stop_signal")
+            if raw_signal is not None:
+                try:
+                    return StopSignal.from_dict(raw_signal)
+                except ValueError as error:
+                    raise CoordinatorError(
+                        "coordinator returned an invalid stop signal"
+                    ) from error
             time.sleep(min(1, max(0, deadline - time.monotonic())))
 
     def _request(
         self, path: str, value: object | None, timeout: float
-    ) -> dict[str, object]:
+    ) -> dict[str, Any]:
         body = None if value is None else json.dumps(value).encode()
         request = urllib.request.Request(
             self.base_url + path,

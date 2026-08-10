@@ -52,7 +52,7 @@ cd /vllm-workspace/vllm-ascend-recipes
 
 ## 启动
 
-先做静态校验：
+先做中间态解码和拓扑检查（这不是 converter 的静态/语义校验）：
 
 ```bash
 RECIPE_CI_PLAN=configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml \
@@ -65,7 +65,7 @@ API 机器作为 `node0` 执行：
 export RECIPE_CI_PLAN=configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml
 export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
 export RECIPE_CI_INTERFACE="<local_interface>"
-export LWS_WORKER_INDEX=0
+export RECIPE_CI_NODE_INDEX=0
 export ASCEND_RT_VISIBLE_DEVICES=4,5
 scripts/recipe_ci/run.sh
 ```
@@ -76,7 +76,7 @@ Headless 机器作为 `node1` 执行：
 export RECIPE_CI_PLAN=configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml
 export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
 export RECIPE_CI_INTERFACE="<local_interface>"
-export LWS_WORKER_INDEX=1
+export RECIPE_CI_NODE_INDEX=1
 export ASCEND_RT_VISIBLE_DEVICES=4,5
 scripts/recipe_ci/run.sh
 ```
@@ -94,13 +94,13 @@ rank 已连接。每节点直接消费 `ASCEND_RT_VISIBLE_DEVICES` 中的两张�
 /tmp/recipe-ci/qwen3-30b-a3b-dp-2n2c/
 ├── node0/
 │   ├── service.log
-│   └── checks/completion.log
+│   └── completion/completion.log
 └── node1/service.log
 ```
 
-plan 中声明的 check、accuracy 和 performance 都会执行，因此应先按
-`docs/MULTI_NODE_RECIPE_CI.md` 准备固定 AISBench，并设置 `RECIPE_AISBENCH_ROOT` 与
-`RECIPE_AISBENCH_BIN`。这个 plan 自带离线 GSM8K 小样本，evaluation 只会把它链接到
+plan 中声明的 completion、accuracy 和 performance stages 都会执行，因此应先按
+`docs/MULTI_NODE_RECIPE_CI.md` 准备固定 AISBench，并设置 `RECIPE_AISBENCH_BIN`。这个
+plan 自带离线 GSM8K 小样本，evaluation 只会把它链接到
 当前步骤的 artifact 目录，不会修改共享的 AISBench 安装或缓存。plan 内的
 `vllm_api_general_chat.py` 和 `vllm_api_stream_chat.py` 分别供精度和性能评测使用，
 evaluation 会用当前 endpoint 和 served model 渲染后再执行；模型配置、数据集和样本数

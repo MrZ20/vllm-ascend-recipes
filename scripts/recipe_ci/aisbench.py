@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preflight AISBench and translate its artifacts to the step-result contract."""
+"""Render AISBench inputs and translate artifacts to the step-result contract."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import csv
 import json
 import os
 import re
-import shutil
 import sys
 from pathlib import Path
 from typing import Iterable
@@ -23,15 +22,6 @@ from scripts.recipe_ci.result import write_json_atomic  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
-
-    preflight = subparsers.add_parser("preflight")
-    preflight.add_argument(
-        "--command",
-        default=os.environ.get("RECIPE_AISBENCH_BIN", "ais_bench"),
-    )
-    preflight.add_argument("--model-config", type=Path, required=True)
-    preflight.add_argument("--dataset-directory", type=Path, required=True)
-    preflight.add_argument("--artifact-directory", type=Path, required=True)
 
     accuracy = subparsers.add_parser("accuracy")
     accuracy.add_argument("--artifact-directory", type=Path, required=True)
@@ -69,24 +59,6 @@ def render_model_config(template: Path, output: Path) -> None:
         content = content.replace(placeholder, replacement)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(content, encoding="utf-8")
-
-
-def preflight(args: argparse.Namespace) -> None:
-    """Check plan-owned inputs; installation is verified by the CI prepare step."""
-    command = shutil.which(args.command) if "/" not in args.command else args.command
-    if (
-        not command
-        or not Path(command).is_file()
-        or not os.access(command, os.X_OK)
-    ):
-        raise RuntimeError(f"AISBench command not found: {args.command}")
-    if not args.model_config.is_file():
-        raise RuntimeError(f"AISBench model config not found: {args.model_config}")
-    if not args.dataset_directory.is_dir():
-        raise RuntimeError(
-            f"AISBench dataset directory not found: {args.dataset_directory}"
-        )
-    args.artifact_directory.mkdir(parents=True, exist_ok=True)
 
 
 def _latest_run(directory: Path) -> Path:
@@ -224,9 +196,6 @@ def main() -> int:
     try:
         if args.action == "render-model-config":
             render_model_config(args.template, args.output)
-            return 0
-        if args.action == "preflight":
-            preflight(args)
             return 0
         if args.action == "accuracy":
             score, source = accuracy_score(args.artifact_directory)

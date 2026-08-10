@@ -43,7 +43,7 @@ spec:
               - -c
               - |
                 set +e
-                bash {{ run_root }}/source/scripts/recipe_ci/run.sh
+                bash {{ run_root }}/source/scripts/recipe_ci/k8s/run_lws.sh
                 status=$?
                 status_file={{ run_root }}/pod-status/node${LWS_WORKER_INDEX}.exit
                 printf '%s\n' "$status" > "$status_file.tmp"
@@ -52,18 +52,8 @@ spec:
             env: &recipe-ci-env
               - name: RECIPE_CI_PLAN
                 value: {{ plan }}
-              - name: RECIPE_AISBENCH_ROOT
-                value: {{ aisbench_root }}
               - name: RECIPE_AISBENCH_BIN
                 value: {{ aisbench_bin }}
-              - name: RECIPE_CI_INSTALL_MOONCAKE
-                value: "true"
-              # Use the cluster cache for runtime installs. /root/.cache/pip is
-              # also persisted by the shared PVC for later Recipe CI runs.
-              - name: PIP_INDEX_URL
-                value: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-              - name: PIP_TRUSTED_HOST
-                value: cache-service.nginx-pypi-cache.svc.cluster.local
               - name: RECIPE_CI_STARTUP_TIMEOUT_SECONDS
                 value: "{{ startup_timeout_seconds }}"
               - name: RECIPE_CI_RUN_TIMEOUT_SECONDS
@@ -74,10 +64,6 @@ spec:
                 value: {{ run_root }}/artifacts
               - name: RECIPE_CI_PLOG_ROOT
                 value: {{ run_root }}/plogs
-              - name: RECIPE_CI_IMAGE
-                value: {{ image }}
-              - name: GITHUB_SHA
-                value: {{ commit }}
               - name: VLLM_LOGGING_LEVEL
                 value: ERROR
               - name: VLLM_USE_MODELSCOPE

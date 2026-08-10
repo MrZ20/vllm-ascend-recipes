@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import signal
 import shutil
 import socket
 import subprocess
@@ -17,15 +18,13 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from scripts.recipe_ci.plan import PlanError, load_hosts, load_plan  # noqa: E402
+from scripts.recipe_ci.plan import load_hosts, load_plan  # noqa: E402
+from scripts.recipe_ci.result import NodeOutcome, RunFailure, StopSignal  # noqa: E402
+from scripts.recipe_ci.runner import aggregate_run_outcome  # noqa: E402
 
 
 EXAMPLE = ROOT / "configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c"
 GENERIC_DP_EXAMPLE = ROOT / "configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c"
-DEEPSEEK_V4_EXAMPLE = (
-    ROOT / "configs/recipe_ci/plans/deepseek-v4-flash-a2-pd-reduced"
-)
-QWEN35_EXAMPLE = ROOT / "configs/recipe_ci/plans/qwen3.5-27b-a2-pd-reduced"
 
 
 def free_port() -> int:
@@ -48,10 +47,12 @@ class PlanTests(unittest.TestCase):
             ["nodes/node0/run.sh", "nodes/node1/run.sh"],
         )
         self.assertEqual(plan.gateway.port, 38085)
-        self.assertEqual(len(plan.evaluations.accuracy), 1)
-        self.assertEqual(len(plan.evaluations.performance), 1)
+        self.assertEqual(
+            [stage.id for stage in plan.stages],
+            ["completion", "accuracy", "performance"],
+        )
 
-    def test_each_node_requires_its_own_launch_script(self) -> None:
+    def test_runtime_trusts_converter_owned_launch_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             copied = Path(directory) / "example"
             shutil.copytree(EXAMPLE, copied)
@@ -59,8 +60,9 @@ class PlanTests(unittest.TestCase):
             raw["nodes"][1]["launch"] = "nodes/node0/run.sh"
             (copied / "plan.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
 
-            with self.assertRaisesRegex(PlanError, "each node must have its own"):
-                load_plan(copied / "plan.yaml")
+            plan = load_plan(copied / "plan.yaml")
+
+        self.assertEqual(plan.nodes[0].launch, plan.nodes[1].launch)
 
     def test_generic_dp_example_has_one_four_rank_group(self) -> None:
         plan = load_plan(GENERIC_DP_EXAMPLE / "plan.yaml")
@@ -89,8 +91,6 @@ class PlanTests(unittest.TestCase):
         for example in (
             EXAMPLE,
             GENERIC_DP_EXAMPLE,
-            DEEPSEEK_V4_EXAMPLE,
-            QWEN35_EXAMPLE,
         ):
             accuracy_config = example / "aisbench/models/vllm_api_general_chat.py"
             performance_config = example / "aisbench/models/vllm_api_stream_chat.py"
@@ -202,84 +202,6 @@ class PlanTests(unittest.TestCase):
 
         self.assertEqual(result.stdout.strip(), "5")
 
-    def test_deepseek_v4_plan_is_an_explicit_two_node_a2_reduced_topology(self) -> None:
-        plan = load_plan(DEEPSEEK_V4_EXAMPLE / "plan.yaml")
-        prefill_run = (DEEPSEEK_V4_EXAMPLE / plan.nodes[0].launch).read_text(
-            encoding="utf-8"
-        )
-        decode_run = (DEEPSEEK_V4_EXAMPLE / plan.nodes[1].launch).read_text(
-            encoding="utf-8"
-        )
-        prefill_template = (
-            DEEPSEEK_V4_EXAMPLE / "nodes/node0/run_dp_template.sh"
-        ).read_text(encoding="utf-8")
-        decode_template = (
-            DEEPSEEK_V4_EXAMPLE / "nodes/node1/run_dp_template.sh"
-        ).read_text(encoding="utf-8")
-        gateway = (DEEPSEEK_V4_EXAMPLE / "gateway/run.sh").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertEqual([node.id for node in plan.nodes], ["node0", "node1"])
-        self.assertEqual([node.role for node in plan.nodes], ["prefill", "decode"])
-        self.assertEqual(plan.name, "deepseek-v4-flash-a2-pd-reduced")
-        self.assertEqual(
-            plan.model.cache_path,
-            "vllm-ascend/DeepSeek-V4-Flash-w8a8-mtp",
-        )
-        self.assertEqual([node.readiness.count for node in plan.nodes], [8, 8])
-        for argument in ("--dp-size 8", "--tp-size 1", "--dp-size-local 8"):
-            self.assertIn(argument, prefill_run)
-        for argument in ("--dp-size 8", "--tp-size 1", "--dp-size-local 8"):
-            self.assertIn(argument, decode_run)
-        self.assertIn('"kv_role": "kv_producer"', prefill_template)
-        self.assertIn('"kv_port": "30000"', prefill_template)
-        self.assertIn('"kv_role": "kv_consumer"', decode_template)
-        self.assertIn('"kv_port": "30100"', decode_template)
-        self.assertIn('"prefill": {"dp_size": 8, "tp_size": 1}', prefill_template)
-        self.assertIn('"decode": {"dp_size": 8, "tp_size": 1}', decode_template)
-        self.assertEqual(gateway.count('"$RECIPE_NODE_0_IP"'), 8)
-        self.assertEqual(gateway.count('"$RECIPE_NODE_1_IP"'), 8)
-        self.assertNotIn("RECIPE_NODE_2_IP", gateway)
-
-    def test_qwen35_plan_keeps_tp2_and_scales_dp_to_four_on_a2(self) -> None:
-        plan = load_plan(QWEN35_EXAMPLE / "plan.yaml")
-        prefill_run = (QWEN35_EXAMPLE / plan.nodes[0].launch).read_text(
-            encoding="utf-8"
-        )
-        decode_run = (QWEN35_EXAMPLE / plan.nodes[1].launch).read_text(
-            encoding="utf-8"
-        )
-        prefill_template = (
-            QWEN35_EXAMPLE / "nodes/node0/run_dp_template.sh"
-        ).read_text(encoding="utf-8")
-        decode_template = (
-            QWEN35_EXAMPLE / "nodes/node1/run_dp_template.sh"
-        ).read_text(encoding="utf-8")
-        gateway = (QWEN35_EXAMPLE / "gateway/run.sh").read_text(encoding="utf-8")
-
-        self.assertEqual([node.id for node in plan.nodes], ["node0", "node1"])
-        self.assertEqual([node.role for node in plan.nodes], ["prefill", "decode"])
-        self.assertEqual([node.readiness.count for node in plan.nodes], [4, 4])
-        self.assertEqual(
-            plan.model.cache_path,
-            "Eco-Tech/Qwen3.5-27B-w8a8-mtp",
-        )
-        for launch in (prefill_run, decode_run):
-            self.assertIn("--dp-size 4", launch)
-            self.assertIn("--tp-size 2", launch)
-            self.assertIn("--dp-size-local 4", launch)
-        self.assertIn('"kv_role": "kv_producer"', prefill_template)
-        self.assertIn('"kv_role": "kv_consumer"', decode_template)
-        for template in (prefill_template, decode_template):
-            self.assertIn('"prefill": {"dp_size": 4, "tp_size": 2}', template)
-            self.assertIn('"decode": {"dp_size": 4, "tp_size": 2}', template)
-            self.assertIn('"method":"qwen3_5_mtp"', template)
-        self.assertEqual(gateway.count('"$RECIPE_NODE_0_IP"'), 4)
-        self.assertEqual(gateway.count('"$RECIPE_NODE_1_IP"'), 4)
-        self.assertNotIn("RECIPE_NODE_2_IP", gateway)
-
-
 class LocalRunnerTests(unittest.TestCase):
     def test_two_nodes_run_every_check_and_evaluation_declared_by_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -296,6 +218,7 @@ class LocalRunnerTests(unittest.TestCase):
             common_environment = os.environ.copy()
             common_environment.update(
                 {
+                    "PATH": f"{Path(sys.executable).parent}:{common_environment['PATH']}",
                     "RECIPE_CI_PLAN": str(plan_dir / "plan.yaml"),
                     "RECIPE_CI_CLUSTER_IPS": "127.0.0.1,127.0.0.1",
                     "RECIPE_CI_INTERFACE": "lo",
@@ -306,8 +229,12 @@ class LocalRunnerTests(unittest.TestCase):
                     "RECIPE_CI_ARTIFACT_ROOT": str(artifact_root),
                 }
             )
-            leader_environment = common_environment | {"LWS_WORKER_INDEX": "0"}
-            worker_environment = common_environment | {"LWS_WORKER_INDEX": "1"}
+            leader_environment = common_environment | {
+                "RECIPE_CI_NODE_INDEX": "0"
+            }
+            worker_environment = common_environment | {
+                "RECIPE_CI_NODE_INDEX": "1"
+            }
             leader = subprocess.Popen(
                 command,
                 env=leader_environment,
@@ -336,7 +263,7 @@ class LocalRunnerTests(unittest.TestCase):
             self.assertIn("plan completed", leader_output)
             self.assertIn("plan completed", worker_output)
             leader_artifacts = artifact_root / "local-runner-test" / "node0"
-            self.assertTrue((leader_artifacts / "checks/health.log").is_file())
+            self.assertTrue((leader_artifacts / "completion/health.log").is_file())
             self.assertEqual(
                 (leader_artifacts / "accuracy/accuracy/result.txt").read_text(
                     encoding="utf-8"
@@ -366,16 +293,22 @@ class LocalRunnerTests(unittest.TestCase):
                 {"node0": "passed", "node1": "passed"},
             )
             self.assertEqual(
-                final_result["evaluations"]["accuracy"]["accuracy"]["metrics"][
+                final_result["stages"]["accuracy"]["accuracy"]["metrics"][
                     "accuracy"
                 ],
                 1.0,
             )
             self.assertEqual(
-                final_result["evaluations"]["performance"]["performance"][
+                final_result["stages"]["performance"]["performance"][
                     "metrics"
                 ]["request_per_second"],
                 2.0,
+            )
+            self.assertEqual(
+                final_result["stages"]["custom-stage"]["custom"]["metrics"][
+                    "value"
+                ],
+                1,
             )
             self.assertEqual(leader_result["status"], "passed")
             self.assertEqual(worker_result["status"], "passed")
@@ -385,6 +318,7 @@ class LocalRunnerTests(unittest.TestCase):
                     "schema_version",
                     "node_id",
                     "status",
+                    "execution_status",
                     "failure",
                     "cleanup_errors",
                 },
@@ -470,12 +404,223 @@ class LocalRunnerTests(unittest.TestCase):
             self.assertEqual(final_result["status"], "failed")
             self.assertEqual(final_result["failure"]["category"], "node_failed")
             self.assertIn("node1", final_result["failure"]["message"])
-            self.assertTrue(
-                (artifact_root / "local-runner-test/node0/node-result.json").is_file()
+            self.assertEqual(final_result["failure_node_id"], "node1")
+            self.assertEqual(
+                final_result["nodes"]["node0"]["execution_status"], "aborted"
             )
-            self.assertTrue(
-                (artifact_root / "local-runner-test/node1/node-result.json").is_file()
+            self.assertIsNone(final_result["nodes"]["node0"]["failure"])
+            self.assertEqual(
+                final_result["nodes"]["node1"]["execution_status"], "failed"
             )
+
+    def test_leader_stage_failure_aborts_worker_without_local_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan_dir = Path(directory)
+            control_port = free_port()
+            prefill_port = free_port()
+            decode_port = free_port()
+            gateway_port = free_port()
+            self._write_fake_runtime(plan_dir)
+            self._write_fake_plan(plan_dir, prefill_port, decode_port, gateway_port)
+            (plan_dir / "evaluations/accuracy.sh").write_text(
+                "echo intentional evaluation failure >&2\nexit 9\n",
+                encoding="utf-8",
+            )
+
+            artifact_root = plan_dir / "artifacts"
+            leader, worker, leader_output, worker_output = self._run_direct_nodes(
+                plan_dir, control_port, artifact_root
+            )
+
+            self.assertNotEqual(leader.returncode, 0, leader_output)
+            self.assertNotEqual(worker.returncode, 0, worker_output)
+            final_result = json.loads(
+                (artifact_root / "local-runner-test/result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(final_result["failure_node_id"], "node0")
+            self.assertEqual(
+                final_result["nodes"]["node0"]["execution_status"], "failed"
+            )
+            self.assertEqual(
+                final_result["nodes"]["node1"]["execution_status"], "aborted"
+            )
+            self.assertIsNone(final_result["nodes"]["node1"]["failure"])
+
+    def test_cleanup_failure_from_worker_makes_the_aggregate_fail(self) -> None:
+        plan = load_plan(EXAMPLE / "plan.yaml")
+        cleanup = RunFailure(
+            category="cleanup_failed", message="worker process group survived"
+        )
+        outcomes = {
+            "node0": NodeOutcome(node_id="node0", execution_status="passed"),
+            "node1": NodeOutcome(
+                node_id="node1",
+                execution_status="passed",
+                cleanup_errors=(cleanup,),
+            ),
+        }
+
+        result = aggregate_run_outcome(
+            plan=plan,
+            outcomes=outcomes,
+            stages={},
+            stop_signal=StopSignal(kind="completed", origin_node_id="node0"),
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.failure_node_id, "node1")
+        self.assertEqual(result.failure, cleanup)
+        self.assertEqual(result.nodes["node1"].execution_status, "passed")
+        self.assertEqual(result.nodes["node1"].status, "failed")
+
+    def test_first_failed_stop_remains_primary_when_another_node_also_fails(self) -> None:
+        plan = load_plan(EXAMPLE / "plan.yaml")
+        leader_failure = RunFailure(category="node_failed", message="leader failed later")
+        worker_failure = RunFailure(category="node_failed", message="worker failed first")
+        outcomes = {
+            "node0": NodeOutcome(
+                node_id="node0", execution_status="failed", failure=leader_failure
+            ),
+            "node1": NodeOutcome(
+                node_id="node1", execution_status="failed", failure=worker_failure
+            ),
+        }
+
+        result = aggregate_run_outcome(
+            plan=plan,
+            outcomes=outcomes,
+            stages={},
+            stop_signal=StopSignal(
+                kind="failed", origin_node_id="node1", failure=worker_failure
+            ),
+        )
+
+        self.assertEqual(result.failure_node_id, "node1")
+        self.assertEqual(result.failure, worker_failure)
+
+    def test_leader_sigterm_cancels_run_after_every_node_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan_dir = Path(directory)
+            control_port = free_port()
+            prefill_port = free_port()
+            decode_port = free_port()
+            gateway_port = free_port()
+            self._write_fake_runtime(plan_dir)
+            self._write_fake_plan(plan_dir, prefill_port, decode_port, gateway_port)
+            (plan_dir / "checks/health.sh").write_text(
+                "sleep 30\nprintf '%s\\n' '{\"status\":\"passed\"}' "
+                '> "$RECIPE_STEP_RESULT_FILE"\n',
+                encoding="utf-8",
+            )
+
+            artifact_root = plan_dir / "artifacts"
+            command = ["bash", str(ROOT / "scripts/recipe_ci/run.sh")]
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{Path(sys.executable).parent}:{environment['PATH']}",
+                    "RECIPE_CI_PLAN": str(plan_dir / "plan.yaml"),
+                    "RECIPE_CI_CLUSTER_IPS": "127.0.0.1,127.0.0.1",
+                    "RECIPE_CI_INTERFACE": "lo",
+                    "VLLM_ASCEND_ROOT": str(plan_dir / "vllm-ascend"),
+                    "RECIPE_CI_CONTROL_PORT": str(control_port),
+                    "RECIPE_CI_STARTUP_TIMEOUT_SECONDS": "20",
+                    "RECIPE_CI_RUN_TIMEOUT_SECONDS": "20",
+                    "RECIPE_CI_ARTIFACT_ROOT": str(artifact_root),
+                }
+            )
+            leader = subprocess.Popen(
+                command,
+                env=environment | {"RECIPE_CI_NODE_INDEX": "0"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            worker = subprocess.Popen(
+                command,
+                env=environment | {"RECIPE_CI_NODE_INDEX": "1"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            check_log = artifact_root / "local-runner-test/node0/completion/health.log"
+            deadline = time.monotonic() + 15
+            while not check_log.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(check_log.exists(), "leader never started the long check")
+            leader.send_signal(signal.SIGTERM)
+            leader_output, _ = leader.communicate(timeout=25)
+            worker_output, _ = worker.communicate(timeout=25)
+
+            self.assertNotEqual(leader.returncode, 0, leader_output)
+            self.assertNotEqual(worker.returncode, 0, worker_output)
+            final_result = json.loads(
+                (artifact_root / "local-runner-test/result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(final_result["status"], "cancelled")
+            self.assertEqual(
+                final_result["nodes"]["node0"]["execution_status"], "cancelled"
+            )
+            self.assertEqual(
+                final_result["nodes"]["node1"]["execution_status"], "aborted"
+            )
+            self.assertEqual(final_result["missing_nodes"], [])
+
+    @staticmethod
+    def _run_direct_nodes(
+        plan_dir: Path, control_port: int, artifact_root: Path
+    ) -> tuple[
+        subprocess.Popen[str], subprocess.Popen[str], str, str
+    ]:
+        hosts_path = plan_dir / "hosts.yaml"
+        hosts_path.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "hosts": {
+                        "node0": {"address": "127.0.0.1", "interface": "lo"},
+                        "node1": {"address": "127.0.0.1", "interface": "lo"},
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        command = [
+            sys.executable,
+            str(ROOT / "scripts/recipe_ci/runner.py"),
+            "--plan",
+            str(plan_dir / "plan.yaml"),
+            "--hosts",
+            str(hosts_path),
+            "--control-port",
+            str(control_port),
+            "--startup-timeout-seconds",
+            "15",
+            "--run-timeout-seconds",
+            "15",
+            "--artifact-root",
+            str(artifact_root),
+        ]
+        leader = subprocess.Popen(
+            [*command, "--node-id", "node0"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        worker = subprocess.Popen(
+            [*command, "--node-id", "node1"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        leader_output, _ = leader.communicate(timeout=25)
+        worker_output, _ = worker.communicate(timeout=25)
+        return leader, worker, leader_output, worker_output
 
     @staticmethod
     def _write_fake_runtime(plan_dir: Path) -> None:
@@ -532,7 +677,9 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
         )
         (plan_dir / "checks/health.sh").write_text(
             "python3 -c 'import os, urllib.request; "
-            'urllib.request.urlopen(os.environ["RECIPE_ENDPOINT"] + "/healthcheck")\'\n',
+            'urllib.request.urlopen(os.environ["RECIPE_ENDPOINT"] + "/healthcheck")\'\n'
+            "printf '%s\\n' '{\"status\":\"passed\"}' "
+            '> "$RECIPE_STEP_RESULT_FILE"\n',
             encoding="utf-8",
         )
         (plan_dir / "evaluations/accuracy.sh").write_text(
@@ -546,6 +693,11 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
             "printf '%s\\n' '{\"status\": \"passed\", "
             "\"type\": \"performance\", \"metrics\": "
             "{\"request_per_second\": 2.0}}' > \"$RECIPE_STEP_RESULT_FILE\"\n",
+            encoding="utf-8",
+        )
+        (plan_dir / "evaluations/custom.sh").write_text(
+            "printf '%s\\n' '{\"status\": \"passed\", "
+            '"metrics": {"value": 1}}\' > "$RECIPE_STEP_RESULT_FILE"\n',
             encoding="utf-8",
         )
 
@@ -574,25 +726,52 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
                 },
             ],
             "gateway": {"launch": "gateway/run.sh", "port": gateway_port},
-            "checks": [
-                {"id": "health", "script": "checks/health.sh", "timeout_seconds": 5}
+            "stages": [
+                {
+                    "id": "completion",
+                    "failure_category": "check_failed",
+                    "steps": [
+                        {
+                            "id": "health",
+                            "script": "checks/health.sh",
+                            "timeout_seconds": 5,
+                        }
+                    ],
+                },
+                {
+                    "id": "accuracy",
+                    "failure_category": "evaluation_failed",
+                    "steps": [
+                        {
+                            "id": "accuracy",
+                            "script": "evaluations/accuracy.sh",
+                            "timeout_seconds": 5,
+                        }
+                    ],
+                },
+                {
+                    "id": "performance",
+                    "failure_category": "evaluation_failed",
+                    "steps": [
+                        {
+                            "id": "performance",
+                            "script": "evaluations/performance.sh",
+                            "timeout_seconds": 5,
+                        }
+                    ],
+                },
+                {
+                    "id": "custom-stage",
+                    "failure_category": "custom_failure",
+                    "steps": [
+                        {
+                            "id": "custom",
+                            "script": "evaluations/custom.sh",
+                            "timeout_seconds": 5,
+                        }
+                    ],
+                },
             ],
-            "evaluations": {
-                "accuracy": [
-                    {
-                        "id": "accuracy",
-                        "script": "evaluations/accuracy.sh",
-                        "timeout_seconds": 5,
-                    }
-                ],
-                "performance": [
-                    {
-                        "id": "performance",
-                        "script": "evaluations/performance.sh",
-                        "timeout_seconds": 5,
-                    }
-                ],
-            },
         }
         (plan_dir / "plan.yaml").write_text(
             yaml.safe_dump(plan_data, sort_keys=False), encoding="utf-8"

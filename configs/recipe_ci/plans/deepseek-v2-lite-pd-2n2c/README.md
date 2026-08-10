@@ -3,7 +3,7 @@
 这个手工中间态用例用于打通第一阶段主链路：两台机器分别承担 Prefill 和 Decode，
 每台机器由 vLLM Ascend 的 `launch_online_dp.py` 启动两个 TP1 实例，因此每节点使用
 2 张 NPU，总计 4 卡。所有后端就绪后，Prefill 节点启动上游 P/D Proxy，再依次执行
-completion 检查和可选的 AISBench 评测。
+plan 中声明的 completion、accuracy 和 performance stages。
 
 该用例不依赖 Recipe 文档转换、Kubernetes 或共享文件系统。
 
@@ -70,7 +70,7 @@ Prefill 机器作为 `node0` 执行：
 export RECIPE_CI_PLAN=configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml
 export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
 export RECIPE_CI_INTERFACE="<local_interface>"
-export LWS_WORKER_INDEX=0
+export RECIPE_CI_NODE_INDEX=0
 export ASCEND_RT_VISIBLE_DEVICES=4,5
 scripts/recipe_ci/run.sh
 ```
@@ -81,7 +81,7 @@ Decode 机器作为 `node1` 执行：
 export RECIPE_CI_PLAN=configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml
 export RECIPE_CI_CLUSTER_IPS="<node0_ip>,<node1_ip>"
 export RECIPE_CI_INTERFACE="<local_interface>"
-export LWS_WORKER_INDEX=1
+export RECIPE_CI_NODE_INDEX=1
 export ASCEND_RT_VISIBLE_DEVICES=4,5
 scripts/recipe_ci/run.sh
 ```
@@ -102,15 +102,15 @@ IP 补充 `NO_PROXY`。
 ├── node0/
 │   ├── service.log
 │   ├── gateway.log
-│   └── checks/completion.log
+│   └── completion/completion.log
 └── node1/service.log
 ```
 
 ## AISBench 阶段
 
-plan 中声明的 completion、accuracy 和 performance 会全部执行。运行前应按
-`docs/MULTI_NODE_RECIPE_CI.md` 准备固定 AISBench，并设置 `RECIPE_AISBENCH_ROOT` 与
-`RECIPE_AISBENCH_BIN`；`run.sh` 不会现场安装。这个轻量 plan 自带 8 条离线 GSM8K
+plan 中声明的 completion、accuracy 和 performance stages 会全部执行。运行前应按
+`docs/MULTI_NODE_RECIPE_CI.md` 准备固定 AISBench，并设置 `RECIPE_AISBENCH_BIN`；`run.sh`
+不会现场安装。这个轻量 plan 自带 8 条离线 GSM8K
 格式样本，evaluation 会把它链接到当前步骤的 artifact 目录，不会下载数据集，也不会
 修改共享的 AISBench 安装或缓存。
 
@@ -118,5 +118,5 @@ plan 内的 `aisbench/models/vllm_api_general_chat.py` 和 `vllm_api_stream_chat
 Recipe 转换产物，分别供精度和性能评测使用。evaluation 会根据当前 endpoint、模型路径和
 served model 将占位符渲染到 artifact 目录，无需修改 AISBench 安装目录。模型配置、
 数据集和样本数已经固定在这个最终执行中间态中；需要改变时应重新生成 plan，而不是在
-执行阶段通过兼容环境变量覆盖。评测命令输出和 AISBench 产物都会写到该节点的
-`accuracy/` 或 `performance/` artifact 目录。
+执行阶段通过兼容环境变量覆盖。评测命令输出和 AISBench 产物都会写到该节点对应的
+stage artifact 目录。

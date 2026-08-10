@@ -32,13 +32,15 @@ if [[ "${RECIPE_CI_VALIDATE_ONLY:-false}" == "true" ]]; then
         --validate-only
 fi
 
-: "${LWS_WORKER_INDEX:?LWS_WORKER_INDEX is required}"
-if [[ ! "$LWS_WORKER_INDEX" =~ ^[0-9]+$ ]]; then
-    echo "LWS_WORKER_INDEX must be a non-negative integer" >&2
+: "${RECIPE_CI_NODE_INDEX:?RECIPE_CI_NODE_INDEX is required}"
+: "${RECIPE_CI_CLUSTER_IPS:?RECIPE_CI_CLUSTER_IPS is required}"
+if [[ ! "$RECIPE_CI_NODE_INDEX" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "RECIPE_CI_NODE_INDEX must be a non-negative integer" >&2
     exit 1
 fi
 
-node_count=$(PLAN_PATH="$RECIPE_CI_PLAN" PYTHONPATH="$SCRIPT_DIR" python3 - <<'PY'
+node_count=$(PLAN_PATH="$RECIPE_CI_PLAN" \
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'PY'
 import os
 from pathlib import Path
 
@@ -53,49 +55,15 @@ if [[ -n "${RECIPE_CI_NODE_COUNT:-}" && "$RECIPE_CI_NODE_COUNT" != "$node_count"
 fi
 export RECIPE_CI_NODE_COUNT=$node_count
 
-if ((LWS_WORKER_INDEX < 0 || LWS_WORKER_INDEX >= node_count)); then
-    echo "LWS_WORKER_INDEX is outside the plan node range: $LWS_WORKER_INDEX" >&2
+if ((RECIPE_CI_NODE_INDEX < 0 || RECIPE_CI_NODE_INDEX >= node_count)); then
+    echo "RECIPE_CI_NODE_INDEX is outside the plan node range: $RECIPE_CI_NODE_INDEX" >&2
     exit 1
 fi
-node_id="node${LWS_WORKER_INDEX}"
-hosts_file="/tmp/recipe-ci-hosts-${LWS_WORKER_INDEX}.yaml"
-
-resolve_ipv4() {
-    local dns=$1
-    local address=""
-    local deadline=$((SECONDS + ${RECIPE_CI_STARTUP_TIMEOUT_SECONDS:-300}))
-    echo "Waiting for cluster DNS: $dns" >&2
-    while ((SECONDS < deadline)); do
-        address=$(getent ahostsv4 "$dns" 2>/dev/null | awk 'NR == 1 {print $1}' || true)
-        if [[ -n "$address" ]]; then
-            printf '%s\n' "$address"
-            return 0
-        fi
-        sleep 1
-    done
-    echo "Unable to resolve cluster DNS: $dns" >&2
-    return 1
-}
+node_id="node${RECIPE_CI_NODE_INDEX}"
+hosts_file="/tmp/recipe-ci-hosts-${RECIPE_CI_NODE_INDEX}.yaml"
 
 cluster_ips=()
-if [[ -n "${RECIPE_CI_CLUSTER_IPS:-}" ]]; then
-    IFS=',' read -r -a cluster_ips <<< "$RECIPE_CI_CLUSTER_IPS"
-else
-    : "${LWS_LEADER_ADDRESS:?set RECIPE_CI_CLUSTER_IPS locally or provide LWS_LEADER_ADDRESS}"
-    IFS='.' read -r leader_name group_name namespace_name _ <<< "$LWS_LEADER_ADDRESS"
-    if [[ -z "$leader_name" || -z "$group_name" || -z "$namespace_name" ]]; then
-        echo "Invalid LWS_LEADER_ADDRESS: $LWS_LEADER_ADDRESS" >&2
-        exit 1
-    fi
-    for ((index = 0; index < node_count; index++)); do
-        if [[ $index -eq 0 ]]; then
-            dns_name=$LWS_LEADER_ADDRESS
-        else
-            dns_name="${leader_name}-${index}.${group_name}.${namespace_name}"
-        fi
-        cluster_ips+=("$(resolve_ipv4 "$dns_name")")
-    done
-fi
+IFS=',' read -r -a cluster_ips <<< "$RECIPE_CI_CLUSTER_IPS"
 
 if [[ ${#cluster_ips[@]} -ne $node_count ]]; then
     echo "RECIPE_CI_CLUSTER_IPS count does not match plan.nodes: ${#cluster_ips[@]} != $node_count" >&2
@@ -110,7 +78,7 @@ export RECIPE_CI_CLUSTER_IPS
     for ((index = 0; index < node_count; index++)); do
         echo "  node${index}:"
         echo "    address: ${cluster_ips[$index]}"
-        if [[ $index -eq $LWS_WORKER_INDEX && -n "${RECIPE_CI_INTERFACE:-}" ]]; then
+        if [[ $index -eq $RECIPE_CI_NODE_INDEX && -n "${RECIPE_CI_INTERFACE:-}" ]]; then
             echo "    interface: $RECIPE_CI_INTERFACE"
         fi
     done
@@ -123,13 +91,7 @@ if [[ -z "${RECIPE_CI_VISIBLE_DEVICES:-}" ]]; then
         export RECIPE_CI_VISIBLE_DEVICES=$ASCEND_VISIBLE_DEVICES
     fi
 fi
-echo "Recipe CI node: index=$LWS_WORKER_INDEX id=$node_id ip=${cluster_ips[$LWS_WORKER_INDEX]}"
-
-if [[ "${RECIPE_CI_INSTALL_MOONCAKE:-false}" == "true" ]]; then
-    mooncake_lib_dir=$("$SCRIPT_DIR/install_mooncake.sh")
-    export LD_LIBRARY_PATH="${mooncake_lib_dir}:${LD_LIBRARY_PATH:-}"
-    echo "Mooncake library path: ${mooncake_lib_dir}"
-fi
+echo "Recipe CI node: index=$RECIPE_CI_NODE_INDEX id=$node_id ip=${cluster_ips[$RECIPE_CI_NODE_INDEX]}"
 
 artifact_root=${RECIPE_CI_ARTIFACT_ROOT:-/tmp/recipe-ci}
 # shellcheck disable=SC2329  # Invoked by the EXIT trap.

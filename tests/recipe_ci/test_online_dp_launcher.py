@@ -13,24 +13,32 @@ WRAPPER = ROOT / "scripts/recipe_ci/run_online_dp.py"
 
 
 class OnlineDpLauncherTests(unittest.TestCase):
-    def run_launcher(self, worker_exit_code: int) -> subprocess.CompletedProcess[str]:
+    def run_launcher(
+        self, worker_exit_code: int, *, expose_processes: bool = True
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary_directory:
             launcher = Path(temporary_directory) / "launch_online_dp.py"
+            processes_line = "processes = []" if expose_processes else "workers = []"
+            append_line = (
+                "processes.append(process)"
+                if expose_processes
+                else "workers.append(process)"
+            )
             launcher.write_text(
                 textwrap.dedent(
-                    """
+                    f"""
                     import multiprocessing
                     import sys
 
                     def worker(exit_code):
                         raise SystemExit(exit_code)
 
-                    processes = []
+                    {processes_line}
                     if __name__ == "__main__":
                         process = multiprocessing.Process(
                             target=worker, args=(int(sys.argv[1]),)
                         )
-                        processes.append(process)
+                        {append_line}
                         process.start()
                         process.join()
                     """
@@ -54,6 +62,19 @@ class OnlineDpLauncherTests(unittest.TestCase):
         result = self.run_launcher(7)
         self.assertEqual(result.returncode, 7, result.stdout)
         self.assertIn("external-DP worker 0 exited with 7", result.stdout)
+
+    def test_upstream_processes_contract_change_fails_closed(self) -> None:
+        result = self.run_launcher(7, expose_processes=False)
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("external-DP launcher contract changed", result.stdout)
+
+    def test_wrapper_records_its_upstream_deletion_condition(self) -> None:
+        text = WRAPPER.read_text(encoding="utf-8")
+
+        self.assertIn("TEMPORARY UPSTREAM WORKAROUND", text)
+        self.assertIn("vllm-project/vllm-ascend/pull/2685", text)
+        self.assertIn("Delete this adapter once upstream propagates", text)
 
 
 if __name__ == "__main__":

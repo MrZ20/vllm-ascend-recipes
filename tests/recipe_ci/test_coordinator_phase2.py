@@ -18,6 +18,12 @@ from scripts.recipe_ci.coordinator import (  # noqa: E402
     LeaderCoordinator,
     RunState,
 )
+from scripts.recipe_ci.result import (  # noqa: E402
+    NodeOutcome,
+    RunFailure,
+    RunOutcome,
+    StopSignal,
+)
 
 
 class FakeResponse:
@@ -54,47 +60,141 @@ def refused() -> urllib.error.URLError:
     )
 
 
+def failure(message: str = "service stopped") -> RunFailure:
+    return RunFailure(category="node_failed", message=message)
+
+
 class RunStateTests(unittest.TestCase):
-    def test_cleanup_does_not_replace_execution_status(self) -> None:
+    def test_ready_and_identical_stop_requests_are_idempotent(self) -> None:
         state = RunState(["node0", "node1"])
         state.mark_ready("node0")
-        state.mark_failed("node0", "service stopped")
-        state.mark_cleaned("node0")
-        state.mark_cleaned("node0")
-
-        snapshot = state.snapshot()
-        self.assertEqual(snapshot["nodes"]["node0"], "failed")
-        self.assertEqual(snapshot["failures"], {"node0": "service stopped"})
-        self.assertEqual(snapshot["cleaned"], ["node0"])
-
-    def test_passing_run_records_success_before_cleanup(self) -> None:
-        state = RunState(["node0", "node1"])
         state.mark_ready("node0")
-        state.mark_ready("node1")
-        state.finish("passed")
-        state.mark_cleaned("node0")
+        signal = StopSignal(kind="failed", origin_node_id="node0", failure=failure())
 
-        self.assertEqual(
-            state.snapshot()["nodes"], {"node0": "passed", "node1": "passed"}
-        )
-
-    def test_first_failure_and_terminal_state_are_preserved(self) -> None:
-        state = RunState(["node0", "node1"])
-        state.mark_failed("node0", "first failure")
-        state.mark_failed("node1", "second failure")
+        state.request_stop(signal)
+        state.request_stop(signal)
 
         snapshot = state.snapshot()
-        self.assertEqual(snapshot["message"], "node0: first failure")
-        self.assertEqual(
-            snapshot["failures"],
-            {"node0": "first failure", "node1": "second failure"},
+        self.assertEqual(snapshot["readiness"]["node0"], "ready")
+        self.assertEqual(snapshot["stop_signal"], signal.to_dict())
+
+    def test_first_stop_signal_is_preserved(self) -> None:
+        state = RunState(["node0", "node1"])
+        first = StopSignal(kind="failed", origin_node_id="node0", failure=failure())
+        second = StopSignal(
+            kind="cancelled",
+            origin_node_id="node1",
+            failure=RunFailure(category="cancelled", message="SIGTERM"),
         )
-        with self.assertRaises(CoordinatorError):
-            state.finish("passed")
+
+        state.request_stop(first)
+        with self.assertRaisesRegex(CoordinatorError, "different stop signal"):
+            state.request_stop(second)
+
+        self.assertEqual(state.stop_signal, first)
+
+    def test_observed_remote_failure_is_not_a_second_local_failure(self) -> None:
+        state = RunState(["node0", "node1"])
+        stop = StopSignal(kind="failed", origin_node_id="node0", failure=failure())
+        state.request_stop(stop)
+        state.report_outcome(
+            NodeOutcome(
+                node_id="node0", execution_status="failed", failure=stop.failure
+            )
+        )
+        state.report_outcome(
+            NodeOutcome(node_id="node1", execution_status="aborted")
+        )
+
+        snapshot = state.snapshot()
+        self.assertEqual(
+            snapshot["outcomes"]["node0"]["execution_status"], "failed"
+        )
+        self.assertEqual(
+            snapshot["outcomes"]["node1"]["execution_status"], "aborted"
+        )
+        self.assertIsNone(snapshot["outcomes"]["node1"]["failure"])
+
+    def test_outcome_report_is_immutable_and_idempotent(self) -> None:
+        state = RunState(["node0"])
+        state.mark_ready("node0")
+        state.request_stop(StopSignal(kind="completed", origin_node_id="node0"))
+        outcome = NodeOutcome(node_id="node0", execution_status="passed")
+
+        state.report_outcome(outcome)
+        state.report_outcome(outcome)
+        with self.assertRaisesRegex(CoordinatorError, "different outcome"):
+            state.report_outcome(
+                NodeOutcome(
+                    node_id="node0",
+                    execution_status="passed",
+                    cleanup_errors=(
+                        RunFailure(category="cleanup_failed", message="group survived"),
+                    ),
+                )
+            )
+
+        self.assertEqual(state.outcomes, {"node0": outcome})
+
+    def test_cleanup_failure_is_part_of_final_outcome(self) -> None:
+        state = RunState(["node0", "node1"])
+        for node_id in state.node_ids:
+            state.mark_ready(node_id)
+        state.request_stop(StopSignal(kind="completed", origin_node_id="node0"))
+        leader = NodeOutcome(node_id="node0", execution_status="passed")
+        cleanup = RunFailure(category="cleanup_failed", message="group survived")
+        worker = NodeOutcome(
+            node_id="node1",
+            execution_status="passed",
+            cleanup_errors=(cleanup,),
+        )
+        state.report_outcome(leader)
+        state.report_outcome(worker)
+        final = RunOutcome(
+            plan="fixture",
+            status="failed",
+            nodes={"node0": leader, "node1": worker},
+            stages={},
+            failure=cleanup,
+            failure_node_id="node1",
+        )
+
+        state.finalize(final)
+        state.finalize(final)
+
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["final_outcome"], final.to_dict())
+
+    def test_finalize_can_explicitly_record_missing_outcomes(self) -> None:
+        state = RunState(["node0", "node1"])
+        local_failure = failure()
+        state.request_stop(
+            StopSignal(
+                kind="failed", origin_node_id="node0", failure=local_failure
+            )
+        )
+        node0 = NodeOutcome(
+            node_id="node0", execution_status="failed", failure=local_failure
+        )
+        state.report_outcome(node0)
+        final = RunOutcome(
+            plan="fixture",
+            status="failed",
+            nodes={"node0": node0},
+            stages={},
+            failure=local_failure,
+            failure_node_id="node0",
+            missing_nodes=("node1",),
+        )
+
+        state.finalize(final)
+
+        self.assertEqual(state.final_outcome, final)
 
     def test_unknown_node_is_rejected(self) -> None:
         with self.assertRaisesRegex(CoordinatorError, "unknown node"):
-            RunState(["node0"]).mark_cleaned("node9")
+            RunState(["node0"]).mark_ready("node9")
 
 
 class CoordinatorHTTPTests(unittest.TestCase):
@@ -106,25 +206,37 @@ class CoordinatorHTTPTests(unittest.TestCase):
         self.addCleanup(self.coordinator.close)
         self.client = CoordinatorClient("127.0.0.1", self.coordinator.port)
 
-    def test_ready_terminal_and_cleanup_round_trip(self) -> None:
+    def test_ready_stop_and_outcome_round_trip(self) -> None:
         for node_id in ("node0", "node1"):
             self.client.mark_ready(node_id, 1)
         self.coordinator.wait_ready(1, lambda: None)
-        self.coordinator.state.finish("passed")
-        for node_id in ("node0", "node1"):
-            self.client.mark_cleaned(node_id)
-        self.coordinator.wait_cleaned(1)
 
-        snapshot = self.client.wait_terminal(1, lambda: None)
-        self.assertEqual(snapshot["status"], "passed")
-        self.assertEqual(snapshot["cleaned"], ["node0", "node1"])
-        self.assertEqual(
-            snapshot["nodes"], {"node0": "passed", "node1": "passed"}
+        signal = StopSignal(kind="completed", origin_node_id="node0")
+        self.client.request_stop(signal)
+        self.client.request_stop(signal)
+        self.assertEqual(self.client.wait_stop(1, lambda: None), signal)
+
+        outcomes = {
+            node_id: NodeOutcome(node_id=node_id, execution_status="passed")
+            for node_id in ("node0", "node1")
+        }
+        for outcome in outcomes.values():
+            self.client.report_outcome(outcome)
+            self.client.report_outcome(outcome)
+        self.assertEqual(self.coordinator.wait_outcomes(1), outcomes)
+
+        final = RunOutcome(
+            plan="fixture",
+            status="passed",
+            nodes=outcomes,
+            stages={"checks": {"health": {"status": "passed"}}},
         )
+        self.coordinator.state.finalize(final)
+        self.assertEqual(self.coordinator.state.final_outcome, final)
 
     def test_invalid_request_returns_a_simple_error(self) -> None:
         with self.assertRaisesRegex(CoordinatorError, "unknown node"):
-            self.client.mark_cleaned("node9")
+            self.client.mark_ready("node9", 1)
 
 
 class CoordinatorStartupTests(unittest.TestCase):

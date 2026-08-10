@@ -30,11 +30,13 @@ concurrency:
 jobs:
   recipe-ci:
     name: ${{ inputs.plan }}
-    runs-on: linux-aarch64-a2b4-8
+    runs-on: linux-aarch64-a2b4-2
     env:
-      IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:v0.23.0rc1
+      CONTROLLER_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu
+      RUNTIME_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:v0.23.0rc1
       STARTUP_TIMEOUT_SECONDS: 3600
       RUN_TIMEOUT_SECONDS: 14400
+      FAILURE_SETTLE_TIMEOUT_SECONDS: 300
       PVC_NAME: vllm-ascend-vllm-ascend-recipes-gy001
     # Leave time for Pod scheduling, cleanup, and artifact upload around the
     # default one-hour startup plus four-hour coordinated run timeout.
@@ -133,7 +135,6 @@ jobs:
           {
             echo "RECIPE_CI_NODE_COUNT=$node_count"
             echo "RECIPE_CI_NPU_PER_NODE=$npu_per_node"
-            echo "RECIPE_CI_COMMIT=$(git rev-parse HEAD)"
           } >> "$GITHUB_ENV"
 
       - name: Prepare AISBench
@@ -144,6 +145,7 @@ jobs:
         run: |
           set -euo pipefail
           exec > >(tee -a "$RECIPE_CI_BUNDLE/controller-logs/prepare-aisbench.log") 2>&1
+          export AIS_BENCH_ENVIRONMENT_IDENTITY="controller=${CONTROLLER_IMAGE};runtime=${RUNTIME_IMAGE}"
           environment_file=$(mktemp)
           scripts/recipe_ci/install_aisbench.sh --env-file "$environment_file"
           cat "$environment_file" >> "$GITHUB_ENV"
@@ -161,17 +163,14 @@ jobs:
           set -euo pipefail
           exec > >(tee -a "$RECIPE_CI_BUNDLE/controller-logs/render-and-launch.log") 2>&1
           python3 - <<'PY'
+          import json
           import os
           from pathlib import Path
 
-          template = Path("scripts/recipe_ci/k8s/lws.yaml.jinja2").read_text(
-              encoding="utf-8"
-          )
           values = {
               "lws_name": os.environ["LWS_NAME"],
               "namespace": os.environ["NAMESPACE"],
-              "image": os.environ["IMAGE"],
-              "commit": os.environ["RECIPE_CI_COMMIT"],
+              "image": os.environ["RUNTIME_IMAGE"],
               "run_root": os.environ["RECIPE_CI_RUN_ROOT"],
               "plan": os.environ["PLAN"],
               "node_count": os.environ["RECIPE_CI_NODE_COUNT"],
@@ -179,17 +178,16 @@ jobs:
               "startup_timeout_seconds": os.environ["STARTUP_TIMEOUT_SECONDS"],
               "run_timeout_seconds": os.environ["RUN_TIMEOUT_SECONDS"],
               "pvc_name": os.environ["PVC_NAME"],
-              "aisbench_root": os.environ["RECIPE_AISBENCH_ROOT"],
               "aisbench_bin": os.environ["RECIPE_AISBENCH_BIN"],
           }
-          for name, value in values.items():
-              template = template.replace("{{ " + name + " }}", value)
-          if "{{" in template:
-              raise SystemExit("unresolved LWS template value")
-          (Path(os.environ["RECIPE_CI_RUN_ROOT"]) / "lws.yaml").write_text(
-              template, encoding="utf-8"
+          (Path(os.environ["RECIPE_CI_RUN_ROOT"]) / "lws-values.json").write_text(
+              json.dumps(values), encoding="utf-8"
           )
           PY
+          python3 scripts/recipe_ci/k8s/render_lws.py \
+            --template scripts/recipe_ci/k8s/lws.yaml.tmpl \
+            --values "$RECIPE_CI_RUN_ROOT/lws-values.json" \
+            --output "$RECIPE_CI_RUN_ROOT/lws.yaml"
           kubectl apply -f "$RECIPE_CI_RUN_ROOT/lws.yaml"
 
       - name: Wait for LWS pods to start
@@ -218,6 +216,7 @@ jobs:
             pids=()
           }
           trap stop_streams EXIT
+          failure_settle_deadline=""
 
           for index in "${!pods[@]}"; do
             pod=${pods[$index]}
@@ -231,20 +230,23 @@ jobs:
           deadline=$((SECONDS + STARTUP_TIMEOUT_SECONDS + RUN_TIMEOUT_SECONDS))
           while ((SECONDS < deadline)); do
             all_finished=true
-            node_failed=false
             for index in "${!pods[@]}"; do
               status_file="$RECIPE_CI_RUN_ROOT/pod-status/node${index}.exit"
               if [[ -f "$status_file" ]]; then
                 exit_code=$(<"$status_file")
-                if [[ "$exit_code" != 0 ]]; then
-                  echo "node${index} failed with exit code $exit_code; stopping the run"
-                  node_failed=true
+                if [[ "$exit_code" != 0 && -z "$failure_settle_deadline" ]]; then
+                  failure_settle_deadline=$((SECONDS + FAILURE_SETTLE_TIMEOUT_SECONDS))
+                  echo "node${index} failed with exit code $exit_code; waiting up to ${FAILURE_SETTLE_TIMEOUT_SECONDS}s for other nodes to finalize"
                 fi
               else
                 all_finished=false
               fi
             done
-            if [[ "$node_failed" == true || "$all_finished" == true ]]; then
+            if [[ "$all_finished" == true ]]; then
+              break
+            fi
+            if [[ -n "$failure_settle_deadline" ]] && ((SECONDS >= failure_settle_deadline)); then
+              echo "Timed out waiting for all nodes to finalize after the first failure"
               break
             fi
             sleep 5

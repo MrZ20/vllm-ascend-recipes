@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the upstream external-DP launcher and propagate worker failures."""
+"""Temporarily make upstream external-DP worker failures visible to Recipe CI."""
 
 from __future__ import annotations
 
@@ -18,12 +18,24 @@ def main() -> int:
         print(f"external-DP launcher not found: {launcher}", file=sys.stderr)
         return 2
 
-    # launch_online_dp.py currently joins its multiprocessing workers without
-    # checking their exit codes. Execute the upstream file unchanged, then use
-    # the process objects it created to make a worker failure visible to CI.
+    # TEMPORARY UPSTREAM WORKAROUND.
+    # vLLM Ascend v0.23.0rc1 joins these workers without checking exit codes:
+    # https://github.com/vllm-project/vllm-ascend/blob/f4a08bddd0cc65a0bd8c3d377b158ae5ca7527db/examples/external_online_dp/launch_online_dp.py
+    # The launcher was introduced by https://github.com/vllm-project/vllm-ascend/pull/2685.
+    # Delete this adapter once upstream propagates worker failures, and execute
+    # launch_online_dp.py directly from each generated node script.
     sys.argv = [str(launcher), *sys.argv[2:]]
     namespace = runpy.run_path(str(launcher), run_name="__main__")
-    processes = namespace.get("processes", [])
+    processes = namespace.get("processes")
+    if not isinstance(processes, list) or any(
+        not hasattr(process, "exitcode") for process in processes
+    ):
+        print(
+            "external-DP launcher contract changed: expected a processes list; "
+            "remove or update the temporary upstream workaround",
+            file=sys.stderr,
+        )
+        return 2
     failures = [
         (index, process.exitcode)
         for index, process in enumerate(processes)
