@@ -135,10 +135,14 @@ class PlanTests(unittest.TestCase):
 
             prepare = (example / "evaluations/prepare_gsm8k.sh").read_text()
             self.assertIn("$RECIPE_STEP_ARTIFACT_DIR/ais_bench", prepare)
+            self.assertIn("AIS_BENCH_DATASETS_CACHE", prepare)
             self.assertNotIn("$RECIPE_AISBENCH_ROOT/ais_bench", prepare)
             for script_name in ("accuracy.sh", "performance.sh"):
                 script = (example / "evaluations" / script_name).read_text()
-                self.assertIn("prepare_gsm8k.sh", script)
+                self.assertIn(
+                    'source "$RECIPE_PLAN_DIR/evaluations/prepare_gsm8k.sh"',
+                    script,
+                )
 
     def test_hosts_must_match_plan_nodes(self) -> None:
         plan = load_plan(EXAMPLE / "plan.yaml")

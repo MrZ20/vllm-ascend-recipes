@@ -4,7 +4,7 @@ set -euo pipefail
 runtime_config_dir=$RECIPE_STEP_ARTIFACT_DIR/aisbench-config
 model_config=vllm_api_general_chat
 
-bash "$RECIPE_PLAN_DIR/evaluations/prepare_gsm8k.sh"
+source "$RECIPE_PLAN_DIR/evaluations/prepare_gsm8k.sh"
 python3 "$RECIPE_REPOSITORY_ROOT/scripts/recipe_ci/aisbench.py" render-model-config \
     --template "$RECIPE_PLAN_DIR/aisbench/models/$model_config.py" \
     --output "$runtime_config_dir/models/$model_config.py"

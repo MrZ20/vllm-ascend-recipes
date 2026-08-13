@@ -745,7 +745,12 @@ def run_node(
         failure = (
             final_outcome.failure
             if final_outcome is not None
-            else node_outcome.failure or node_outcome.cleanup_errors[0]
+            else node_outcome.failure
+            or (
+                node_outcome.cleanup_errors[0]
+                if node_outcome.cleanup_errors
+                else None
+            )
         )
         raise RunnerError(f"{effective_status}: {failure.message if failure else node.id}")
     print("plan completed")
