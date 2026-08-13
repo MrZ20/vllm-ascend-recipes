@@ -264,7 +264,7 @@ def run_stage(
         )
         script = plan.directory / step.script
         log_path = stage_directory / f"{step.id}.log"
-        print(f"[leader] running {stage.id}: {step.id}; log: {log_path}")
+        print(f"running {stage.id}: {step.id}; log: {log_path}")
         item = start_process(
             f"{stage.id} {step.id}",
             ["bash", script.name],
@@ -501,14 +501,14 @@ def run_node(
                     )
                     coordinator.start()
                 else:
-                    print(f"[{node.id}] waiting for the leader coordinator")
+                    print("waiting for the leader coordinator")
                     client.wait_available(
                         args.startup_timeout_seconds, check_cancellation
                     )
 
                 launch_script = plan.directory / node.launch
                 print(
-                    f"[{node.id}] starting service launcher; "
+                    "starting service launcher; "
                     f"log: {artifact_directory / 'service.log'}"
                 )
                 service_process = start_process(
@@ -542,7 +542,7 @@ def run_node(
                 if coordinator is not None:
                     coordinator.state.mark_ready(node.id)
                     print(
-                        f"[{node.id}] local service ready; waiting for the other nodes"
+                        "local service ready; waiting for the other nodes"
                     )
                     coordinator.wait_ready(
                         args.startup_timeout_seconds, check_local_runtime
@@ -551,7 +551,7 @@ def run_node(
                     if plan.gateway:
                         gateway_script = plan.directory / plan.gateway.launch
                         print(
-                            f"[{node.id}] starting gateway; "
+                            "starting gateway; "
                             f"log: {artifact_directory / 'gateway.log'}"
                         )
                         gateway_process = start_process(
@@ -603,7 +603,7 @@ def run_node(
                 else:
                     client.mark_ready(node.id, args.startup_timeout_seconds)
                     print(
-                        f"[{node.id}] local service ready; waiting for execution to stop"
+                        "local service ready; waiting for execution to stop"
                     )
                     stop_signal = client.wait_stop(
                         args.run_timeout_seconds, check_local_runtime
@@ -748,7 +748,7 @@ def run_node(
             else node_outcome.failure or node_outcome.cleanup_errors[0]
         )
         raise RunnerError(f"{effective_status}: {failure.message if failure else node.id}")
-    print(f"[{node.id}] plan completed")
+    print("plan completed")
 
 
 def main() -> int:

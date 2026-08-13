@@ -91,17 +91,7 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertIn("len(plan.nodes)", text)
         self.assertIn("plan.resources.npu_per_node", text)
         self.assertIn("python3 -m pip install pyyaml", text)
-        self.assertIn("- name: Prepare AISBench", text)
-        self.assertIn(
-            "scripts/recipe_ci/install_aisbench.sh --env-file", text
-        )
-        self.assertIn("RECIPE_AISBENCH_BIN", text)
-        self.assertIn("AIS_BENCH_ENVIRONMENT_IDENTITY", text)
-        self.assertIn("controller=${CONTROLLER_IMAGE};runtime=${RUNTIME_IMAGE}", text)
-        self.assertLess(
-            text.index("- name: Prepare AISBench"),
-            text.index("- name: Render and launch LeaderWorkerSet"),
-        )
+        self.assertNotIn("- name: Prepare AISBench", text)
         self.assertIn("linux-aarch64-a2b4-1", text)
         self.assertIn("vllm-ascend-vllm-ascend-recipes", text)
         self.assertIn("vllm-ascend-vllm-ascend-recipes-gy001", text)
@@ -152,9 +142,6 @@ class MultiNodeWorkflowTests(unittest.TestCase):
             "startup_timeout_seconds": "3600",
             "run_timeout_seconds": "14400",
             "pvc_name": "recipe-ci-pvc",
-            "aisbench_bin": (
-                "/root/.cache/recipe-ci/tools/aisbench/cache-key/venv/bin/ais_bench"
-            ),
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -272,16 +259,23 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertEqual(volumes["shm-volume"]["emptyDir"]["sizeLimit"], "16Gi")
         env = {item["name"]: item["value"] for item in leader["env"]}
         self.assertEqual(env["RECIPE_CI_NODE_COUNT"], "4")
+        self.assertEqual(env["RECIPE_CI_RUN_ROOT"], "/root/.cache/recipe-ci/123-1")
         self.assertNotIn("RECIPE_CI_INSTALL_AISBENCH", env)
         self.assertNotIn("RECIPE_CI_INSTALL_MOONCAKE", env)
         self.assertNotIn("AIS_BENCH_ROOT", env)
         self.assertNotIn("RECIPE_AISBENCH_ROOT", env)
         self.assertEqual(
-            env["RECIPE_AISBENCH_BIN"],
-            "/root/.cache/recipe-ci/tools/aisbench/cache-key/venv/bin/ais_bench",
+            env["AIS_BENCH_ENVIRONMENT_IDENTITY"],
+            "runtime=example.invalid/vllm-ascend:test-a2",
         )
-        self.assertNotIn("PIP_INDEX_URL", env)
-        self.assertNotIn("PIP_TRUSTED_HOST", env)
+        self.assertEqual(
+            env["PIP_INDEX_URL"],
+            "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple",
+        )
+        self.assertEqual(
+            env["PIP_TRUSTED_HOST"],
+            "cache-service.nginx-pypi-cache.svc.cluster.local",
+        )
         self.assertNotIn("RECIPE_CI_IMAGE", env)
         self.assertNotIn("GITHUB_SHA", env)
         self.assertNotIn("RECIPE_CI_VISIBLE_DEVICES", env)
@@ -289,6 +283,22 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertNotIn("RECIPE_AISBENCH_ACCURACY_DATASET_DIR", env)
         self.assertNotIn("RECIPE_AISBENCH_PERFORMANCE_DATASET_DIR", env)
         self.assertNotIn("RECIPE_CI_INTERFACE", env)
+
+        adapter = LWS_ADAPTER.read_text(encoding="utf-8")
+        self.assertIn('bash "$SCRIPT_DIR/../install_aisbench.sh"', adapter)
+        self.assertIn('--env-file "$aisbench_environment_tmp"', adapter)
+        self.assertIn("if ((LWS_WORKER_INDEX == 0)); then", adapter)
+        self.assertIn('while [[ ! -s "$aisbench_environment" ]]', adapter)
+        self.assertIn(
+            'mv "$aisbench_environment_tmp" "$aisbench_environment"', adapter
+        )
+        self.assertIn(
+            "export RECIPE_AISBENCH_BIN RECIPE_AISBENCH_CACHE_KEY", adapter
+        )
+        self.assertLess(
+            adapter.index("install_aisbench.sh"),
+            adapter.index('exec bash "$SCRIPT_DIR/../run.sh"'),
+        )
 
         workflow = REUSABLE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('kubectl delete leaderworkerset "$LWS_NAME"', workflow)

@@ -144,9 +144,8 @@ if [[ "$actual_commit" != "$AIS_BENCH_EXPECTED_COMMIT" ]]; then
     exit 1
 fi
 
-# Reuse the preparation image's large framework dependencies while keeping
-# AISBench in the cache. The cache identity binds both preparation and runtime
-# image references because this venv is later consumed inside the LWS image.
+# Reuse the runtime image's framework dependencies while keeping AISBench in
+# the shared cache.
 "$AIS_BENCH_PYTHON" -m venv --system-site-packages "$staging_directory/venv"
 "$staging_directory/venv/bin/python" -m pip install \
     --constraint "$AIS_BENCH_CONSTRAINTS" \

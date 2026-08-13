@@ -108,9 +108,8 @@ IP 补充 `NO_PROXY`。
 
 ## AISBench 阶段
 
-plan 中声明的 completion、accuracy 和 performance stages 会全部执行。运行前应按
-`docs/MULTI_NODE_RECIPE_CI.md` 准备固定 AISBench，并设置 `RECIPE_AISBENCH_BIN`；`run.sh`
-不会现场安装。这个轻量 plan 自带 8 条离线 GSM8K
+plan 中声明的 completion、accuracy 和 performance stages 会全部执行。LWS 入口会在
+`run.sh` 前准备或复用共享 AISBench cache。这个轻量 plan 自带 8 条离线 GSM8K
 格式样本，evaluation 会把它链接到当前步骤的 artifact 目录，不会下载数据集，也不会
 修改共享的 AISBench 安装或缓存。
 

@@ -30,7 +30,7 @@ concurrency:
 jobs:
   recipe-ci:
     name: ${{ inputs.plan }}
-    runs-on: linux-aarch64-a2b4-2
+    runs-on: linux-aarch64-a2b4-1
     env:
       CONTROLLER_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu-py3.12
       RUNTIME_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:v0.23.0rc1
@@ -137,25 +137,6 @@ jobs:
             echo "RECIPE_CI_NPU_PER_NODE=$npu_per_node"
           } >> "$GITHUB_ENV"
 
-      - name: Prepare AISBench
-        env:
-          AIS_BENCH_CACHE_ROOT: /root/.cache/recipe-ci/tools/aisbench
-          PIP_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-          PIP_TRUSTED_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
-        run: |
-          set -euo pipefail
-          exec > >(tee -a "$RECIPE_CI_BUNDLE/controller-logs/prepare-aisbench.log") 2>&1
-          export AIS_BENCH_ENVIRONMENT_IDENTITY="controller=${CONTROLLER_IMAGE};runtime=${RUNTIME_IMAGE}"
-          environment_file=$(mktemp)
-          scripts/recipe_ci/install_aisbench.sh --env-file "$environment_file"
-          cat "$environment_file" >> "$GITHUB_ENV"
-
-          aisbench_bin=$(sed -n 's/^RECIPE_AISBENCH_BIN=//p' "$environment_file")
-          aisbench_cache_key=$(sed -n 's/^RECIPE_AISBENCH_CACHE_KEY=//p' "$environment_file")
-          test -x "$aisbench_bin"
-          "$aisbench_bin" -h >/dev/null
-          echo "AISBench cache key: $aisbench_cache_key"
-
       - name: Render and launch LeaderWorkerSet
         env:
           PLAN: ${{ inputs.plan }}
@@ -178,7 +159,6 @@ jobs:
               "startup_timeout_seconds": os.environ["STARTUP_TIMEOUT_SECONDS"],
               "run_timeout_seconds": os.environ["RUN_TIMEOUT_SECONDS"],
               "pvc_name": os.environ["PVC_NAME"],
-              "aisbench_bin": os.environ["RECIPE_AISBENCH_BIN"],
           }
           (Path(os.environ["RECIPE_CI_RUN_ROOT"]) / "lws-values.json").write_text(
               json.dumps(values), encoding="utf-8"

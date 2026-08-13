@@ -99,7 +99,7 @@ rank 已连接。每节点直接消费 `ASCEND_RT_VISIBLE_DEVICES` 中的两张�
 ```
 
 plan 中声明的 completion、accuracy 和 performance stages 都会执行，因此应先按
-`docs/MULTI_NODE_RECIPE_CI.md` 准备固定 AISBench，并设置 `RECIPE_AISBENCH_BIN`。这个
+`docs/MULTI_NODE_RECIPE_CI.md` 由 LWS 入口准备或复用共享 AISBench cache。这个
 plan 自带离线 GSM8K 小样本，evaluation 只会把它链接到
 当前步骤的 artifact 目录，不会修改共享的 AISBench 安装或缓存。plan 内的
 `vllm_api_general_chat.py` 和 `vllm_api_stream_chat.py` 分别供精度和性能评测使用，

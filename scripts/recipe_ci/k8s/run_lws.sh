@@ -19,6 +19,24 @@ if ((LWS_WORKER_INDEX >= RECIPE_CI_NODE_COUNT)); then
     exit 1
 fi
 
+if [[ ${RECIPE_CI_VALIDATE_ONLY:-false} != true ]]; then
+    : "${RECIPE_CI_RUN_ROOT:?RECIPE_CI_RUN_ROOT is required}"
+    aisbench_environment="$RECIPE_CI_RUN_ROOT/aisbench.env"
+    if ((LWS_WORKER_INDEX == 0)); then
+        aisbench_environment_tmp="${aisbench_environment}.tmp"
+        bash "$SCRIPT_DIR/../install_aisbench.sh" \
+            --env-file "$aisbench_environment_tmp"
+        mv "$aisbench_environment_tmp" "$aisbench_environment"
+    else
+        echo "waiting for node0 to prepare AISBench"
+        while [[ ! -s "$aisbench_environment" ]]; do
+            sleep 5
+        done
+    fi
+    source "$aisbench_environment"
+    export RECIPE_AISBENCH_BIN RECIPE_AISBENCH_CACHE_KEY
+fi
+
 IFS='.' read -r leader_name group_name namespace_name _ <<< "$LWS_LEADER_ADDRESS"
 if [[ -z "$leader_name" || -z "$group_name" || -z "$namespace_name" ]]; then
     echo "Invalid LWS_LEADER_ADDRESS: $LWS_LEADER_ADDRESS" >&2

@@ -161,25 +161,24 @@ artifacts/<plan>/
 
 ## AISBench 准备与缓存
 
-固定运行镜像不包含 AISBench。GitHub Actions 在创建 LWS 前使用独立的
-`Prepare AISBench` step 执行：
+固定运行镜像不包含 AISBench。LWS 的 node0 在各节点进入 `run.sh` 前执行：
 
 ```bash
-AIS_BENCH_ENVIRONMENT_IDENTITY='<preparation and runtime identity>' \
+AIS_BENCH_ENVIRONMENT_IDENTITY='runtime=<runtime image>' \
 scripts/recipe_ci/install_aisbench.sh --env-file /tmp/aisbench.env
 ```
 
 脚本固定 tag 和 commit，并把下列输入绑定到共享 PVC cache key：
 
 - cache schema 与 AISBench commit；
-- preparation/runtime 环境 identity；
+- runtime image identity；
 - Python 主次版本、CPU 架构和 constraints 摘要。
 
-命中完整缓存时校验 `READY`、源码 commit、入口可执行性和 `ais_bench -h` 后直接复用；冷
-cache 在 per-key lock 下安装到临时目录，再原子发布。当前 workflow identity 绑定 controller
-和 runtime 镜像引用；若基础设施可提供不可变 digest，应优先把 digest 放入 identity。
+命中完整缓存时直接复用；冷 cache 安装到临时目录后原子发布。node0 负责准备 AISBench 并
+把环境文件写入本次运行的共享目录，其他节点等待该文件。所有节点拿到同一个
+`RECIPE_AISBENCH_BIN` 后才进入 `run.sh` 并启动服务。
+Runtime Pod 通过集群内部 PyPI cache 下载 AISBench 依赖。
 
-Pod 只消费 `RECIPE_AISBENCH_BIN`，模型测试阶段不 clone、不安装，也不执行重复 preflight。
 生成的 evaluation 脚本负责准备自己的小数据和配置，调用固定入口，
 再由 `aisbench.py` 把公共指标写入 `RECIPE_STEP_RESULT_FILE`。
 
@@ -229,10 +228,10 @@ scripts/recipe_ci/run.sh
 
 ```text
 无 NPU controller checkout 源码
-  -> Prepare AISBench 到共享 PVC（cache 命中则跳过安装）
   -> 解析 node_count / npu_per_node
   -> render_lws.py 渲染并创建 LeaderWorkerSet
-  -> Pod 通过 run_lws.sh 进入通用 run.sh
+  -> Pod 通过 run_lws.sh 准备或复用共享 AISBench cache
+  -> 所有 Pod 准备完成后进入通用 run.sh
   -> Pod 将退出码、artifact 和 plog 写入共享 PVC
   -> 第一个失败后最多等待 300 秒，让其他节点完成 stop/cleanup/outcome
   -> 删除 LWS，打包日志

@@ -52,14 +52,20 @@ spec:
             env: &recipe-ci-env
               - name: RECIPE_CI_PLAN
                 value: {{ plan }}
-              - name: RECIPE_AISBENCH_BIN
-                value: {{ aisbench_bin }}
+              - name: AIS_BENCH_ENVIRONMENT_IDENTITY
+                value: runtime={{ image }}
+              - name: PIP_INDEX_URL
+                value: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+              - name: PIP_TRUSTED_HOST
+                value: cache-service.nginx-pypi-cache.svc.cluster.local
               - name: RECIPE_CI_STARTUP_TIMEOUT_SECONDS
                 value: "{{ startup_timeout_seconds }}"
               - name: RECIPE_CI_RUN_TIMEOUT_SECONDS
                 value: "{{ run_timeout_seconds }}"
               - name: RECIPE_CI_NODE_COUNT
                 value: "{{ node_count }}"
+              - name: RECIPE_CI_RUN_ROOT
+                value: {{ run_root }}
               - name: RECIPE_CI_ARTIFACT_ROOT
                 value: {{ run_root }}/artifacts
               - name: RECIPE_CI_PLOG_ROOT
