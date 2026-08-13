@@ -32,7 +32,7 @@ jobs:
     name: ${{ inputs.plan }}
     runs-on: linux-aarch64-a2b4-2
     env:
-      CONTROLLER_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu
+      CONTROLLER_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu-py3.12
       RUNTIME_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:v0.23.0rc1
       STARTUP_TIMEOUT_SECONDS: 3600
       RUN_TIMEOUT_SECONDS: 14400
@@ -42,7 +42,7 @@ jobs:
     # default one-hour startup plus four-hour coordinated run timeout.
     timeout-minutes: 360
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu-py3.12
       env:
         KUBECONFIG: /tmp/kubeconfig
         NAMESPACE: vllm-ascend-vllm-ascend-recipes

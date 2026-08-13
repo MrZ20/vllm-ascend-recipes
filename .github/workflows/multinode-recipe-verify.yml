@@ -176,12 +176,12 @@ jobs:
     # stalled on the log flush). If a2b4-1 has either problem, fall back to
     # linux-aarch64-a2b4-8.
     runs-on: linux-aarch64-a2b4-1
-    # Run the controller in upstream's CPU image (vllm-ascend:nightly-cpu),
+    # Run the controller in upstream's CPU image (vllm-ascend:nightly-cpu-py3.12)
     # same as _e2e_nightly_multi_node.yaml: kubectl + python are baked in, and
     # all steps share ONE container so /tmp persists (the bare ARC runner had
     # neither kubectl nor persistent /tmp).
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu-py3.12
       env:
         KUBECONFIG: /tmp/kubeconfig
         # The controller's kubeconfig authenticates as the runner's own
@@ -212,7 +212,7 @@ jobs:
         run: |
           set -u
           mkdir -p /tmp/multinode-results
-          # nightly-cpu already ships kubectl (v1.35.0); only install if missing.
+          # nightly-cpu-py3.12 already ships kubectl (v1.35.0); only install if missing.
           if command -v kubectl >/dev/null 2>&1; then
             echo "kubectl already present at $(command -v kubectl): $(kubectl version --client 2>&1 | head -1)" \
               | tee /tmp/multinode-results/install-kubectl.txt
@@ -341,7 +341,7 @@ jobs:
 
       - name: Install AISBench
         # Same as the single-node nightly: install ais_bench on the runner and
-        # let the controller drive accuracy/performance over HTTP. nightly-cpu
+        # let the controller drive accuracy/performance over HTTP. nightly-cpu-py3.12
         # has no torch, so install the CPU torch first (cluster PyPI cache).
         run: |
           pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
