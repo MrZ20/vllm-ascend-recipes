@@ -16,17 +16,17 @@ spec:
       spec:
         hostNetwork: true
         dnsPolicy: ClusterFirstWithHostNet
-        nodeSelector: &recipe-ci-node-selector
+        nodeSelector: &runtime-node-selector
           node.kubernetes.io/npu.chip.name: 910B4
         # run.sh already stops vLLM and copies plogs before writing the status
         # file watched by the controller. Keep a short window for cancellation.
         terminationGracePeriodSeconds: 30
-        tolerations: &recipe-ci-tolerations
+        tolerations: &runtime-tolerations
           - key: dedicated
             operator: Equal
             value: night
             effect: NoSchedule
-        affinity: &recipe-ci-affinity
+        affinity: &runtime-affinity
           podAntiAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
               - labelSelector:
@@ -34,11 +34,11 @@ spec:
                     recipe-ci-run: {{ lws_name }}
                 topologyKey: kubernetes.io/hostname
         containers:
-          - name: recipe-ci-leader
+          - name: runner
             image: {{ image }}
             imagePullPolicy: IfNotPresent
             workingDir: {{ run_root }}/source
-            command: &recipe-ci-command
+            command: &runtime-command
               - bash
               - -c
               - |
@@ -49,7 +49,7 @@ spec:
                 printf '%s\n' "$status" > "$status_file.tmp"
                 mv "$status_file.tmp" "$status_file"
                 exec sleep infinity
-            env: &recipe-ci-env
+            env: &runtime-env
               - name: RECIPE_CI_PLAN
                 value: {{ plan }}
               - name: AIS_BENCH_ENVIRONMENT_IDENTITY
@@ -80,7 +80,7 @@ spec:
                 value: spawn
               - name: TORCH_DEVICE_BACKEND_AUTOLOAD
                 value: "0"
-            resources: &recipe-ci-resources
+            resources: &runtime-resources
               requests:
                 huawei.com/ascend-1980: {{ npu_per_node }}
                 cpu: 8
@@ -90,14 +90,14 @@ spec:
                 huawei.com/ascend-1980: {{ npu_per_node }}
                 memory: 128Gi
                 ephemeral-storage: 20Gi
-            securityContext: &recipe-ci-security-context
+            securityContext: &runtime-security-context
               privileged: true
             ports:
               - name: coordinator
                 containerPort: 29599
               - name: gateway
                 containerPort: 38085
-            volumeMounts: &recipe-ci-volume-mounts
+            volumeMounts: &runtime-volume-mounts
               - name: shared-volume
                 mountPath: /root/.cache
               - name: driver-tools
@@ -106,7 +106,7 @@ spec:
                 mountPath: /root/ascend/log
               - name: shm-volume
                 mountPath: /dev/shm
-        volumes: &recipe-ci-volumes
+        volumes: &runtime-volumes
           - name: shared-volume
             persistentVolumeClaim:
               claimName: {{ pvc_name }}
@@ -127,18 +127,18 @@ spec:
       spec:
         hostNetwork: true
         dnsPolicy: ClusterFirstWithHostNet
-        nodeSelector: *recipe-ci-node-selector
+        nodeSelector: *runtime-node-selector
         terminationGracePeriodSeconds: 30
-        tolerations: *recipe-ci-tolerations
-        affinity: *recipe-ci-affinity
+        tolerations: *runtime-tolerations
+        affinity: *runtime-affinity
         containers:
-          - name: recipe-ci-worker
+          - name: runner
             image: {{ image }}
             imagePullPolicy: IfNotPresent
             workingDir: {{ run_root }}/source
-            command: *recipe-ci-command
-            env: *recipe-ci-env
-            resources: *recipe-ci-resources
-            securityContext: *recipe-ci-security-context
-            volumeMounts: *recipe-ci-volume-mounts
-        volumes: *recipe-ci-volumes
+            command: *runtime-command
+            env: *runtime-env
+            resources: *runtime-resources
+            securityContext: *runtime-security-context
+            volumeMounts: *runtime-volume-mounts
+        volumes: *runtime-volumes

@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  recipe-ci:
+  verify:
     # pull_request workflows cannot safely expose cluster credentials to forks.
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:

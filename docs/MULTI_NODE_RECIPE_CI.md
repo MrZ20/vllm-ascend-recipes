@@ -28,8 +28,7 @@ configs/recipe_ci/plans/<case>/
 ├── nodes/node0...nodeN/
 ├── gateway/                 # 可选
 ├── checks/
-├── evaluations/
-└── aisbench/                # 仅使用 AISBench 的生成用例需要
+└── evaluations/
 
 scripts/recipe_ci/
 ├── plan.py                  # 可信 plan 解码；hosts 做运行时一致性检查
@@ -37,7 +36,7 @@ scripts/recipe_ci/
 ├── coordinator.py           # 本地/裸机/LWS 共用的 HTTP 状态通道
 ├── process.py               # 进程组、信号、日志和清理
 ├── result.py                # outcome schema、序列化和原子写盘
-├── aisbench.py              # AISBench 结果适配，不负责安装或业务 preflight
+├── aisbench.py              # 下载数据、复制固定模板、执行并转换 AISBench 结果
 ├── install_aisbench.sh      # 测试前准备共享缓存
 ├── run.sh                   # 与基础设施无关的统一节点入口
 └── k8s/
@@ -45,6 +44,73 @@ scripts/recipe_ci/
     ├── lws.yaml.tmpl        # 简单占位模板
     └── render_lws.py        # 严格替换模板占位符
 ```
+
+## `runner.py` 中文阅读导读（临时注释）
+
+这一节按 `scripts/recipe_ci/runner.py` 的函数和调用顺序解释代码。它是阅读
+辅助，不是新的运行时契约；真正的输入仍以 plan、hosts 和脚本实现为准。
+
+### 函数地图
+
+| 函数 | 作用 |
+| --- | --- |
+| `parse_args` | 解析 Runner 的内部命令行参数；`run.sh` 会调用它。 |
+| `interface_addresses` | 获取本机网卡与 IPv4 的对应关系。 |
+| `select_interface` | 选择 HCCL/Gloo 等跨节点通信网卡。 |
+| `resolve_vllm_ascend_root` | 确定镜像内 vLLM Ascend 源码目录。 |
+| `base_environment` | 把 plan、hosts、模型、节点和 artifact 信息转换成环境变量。 |
+| `wait_http_ready` | 轮询一个 HTTP 健康地址。 |
+| `wait_node_ready` | 按节点的 `readiness` 检查一个或多个服务端口。 |
+| `run_stage` | 顺序执行 stage steps，检查退出码和 `result.json`。 |
+| `aggregate_run_outcome` | 根据最终节点结果生成唯一的全局结果。 |
+| `run_node` | 当前节点的完整生命周期，代码主体在这里。 |
+| `main` | 读取 plan/hosts，选择 validate-only 或真实执行模式。 |
+
+### 主流程
+
+```text
+main
+  ├─ load_plan / load_hosts
+  ├─ validate-only？打印拓扑后结束
+  └─ run_node
+       ├─ 选择本机网卡，构造环境变量
+       ├─ node0 启动 LeaderCoordinator；worker 等待 coordinator
+       ├─ 启动 plan.nodes[node].launch
+       ├─ 等待本节点 readiness
+       ├─ leader 等待所有节点 ready
+       ├─ leader 启动可选 gateway 并检查 gateway health
+       ├─ leader 顺序执行 plan.stages
+       ├─ 任一失败/取消时发布 StopSignal
+       ├─ 清理本节点所有进程组
+       ├─ 写入并上报 node-result.json
+       └─ leader 聚合并写入 result.json
+```
+
+### 几个容易混淆的边界
+
+- `runner.py` 不会推导 P/D、DP/TP、rank、KV Connector 或 proxy backend；这些
+  都在 `nodes/nodeN/run.sh`、`run_dp_template.sh` 和 `gateway/run.sh` 中显式定义。
+- `Coordinator` 只传输 ready、stop signal 和 NodeOutcome，不传输 service.log。
+- `start_process` 会把 service、gateway 和 stage 分别写入 artifact 日志，并为
+  每个受管命令创建独立进程组；因此不是“新开终端”，而是同一 Pod 内的受管子进程。
+- StopSignal 只是让其他节点尽快进入清理阶段；最终结论要等 NodeOutcome 收集后，
+  由 `aggregate_run_outcome` 生成。
+- worker 只启动自己的 service、上报 ready 并等待 stop；gateway 和 stages 由 leader
+  执行一次。
+
+### 失败归因顺序
+
+`aggregate_run_outcome` 不把所有异常简单合并，而是按以下顺序选主因：
+
+1. 首个失败节点发布的执行失败；
+2. 其他节点自身的执行失败；
+3. 进程清理失败；
+4. coordinator 结果收集失败或节点缺失；
+5. 取消；
+6. 所有节点通过。
+
+因此，观察到 leader 失败而退出的 worker 通常是 `aborted`，不会被重复记录成第二个
+primary failure。
 
 中间态显式提供节点脚本、readiness、可选 gateway 和任意命名的 `stages`。每个 stage 包含
 `id`、`failure_category` 和顺序执行的 steps；Runtime 不内置 `checks`、`accuracy`、
@@ -113,10 +179,11 @@ RECIPE_NODE_0_IP / RECIPE_NODE_1_IP / ...
 RECIPE_MODEL_PATH / RECIPE_SERVED_MODEL_NAME
 RECIPE_ENDPOINT / RECIPE_ENDPOINT_HOST / RECIPE_ENDPOINT_PORT
 RECIPE_ARTIFACT_ROOT / RECIPE_NODE_ARTIFACT_DIR
-RECIPE_STEP_ARTIFACT_DIR / RECIPE_STEP_RESULT_FILE
+RECIPE_STEP_ARTIFACT_DIR / RECIPE_STEP_INPUT_FILE / RECIPE_STEP_RESULT_FILE
 ```
 
-每个 stage step 必须在退出前向 `RECIPE_STEP_RESULT_FILE` 写入 JSON，至少包含
+Runner 会把 step 的通用 `inputs` 写入 `RECIPE_STEP_INPUT_FILE`。每个 stage step 必须在
+退出前向 `RECIPE_STEP_RESULT_FILE` 写入 JSON，至少包含
 `{"status": "passed"}`。Runtime 只检查公共 status，不解析工具私有日志或业务指标。
 
 ## 生命周期与结果协议
@@ -176,14 +243,14 @@ scripts/recipe_ci/install_aisbench.sh --env-file /tmp/aisbench.env
 
 命中完整缓存时直接复用；冷 cache 安装到临时目录后原子发布。node0 负责准备 AISBench 并
 把环境文件写入本次运行的共享目录，其他节点等待该文件。所有节点拿到同一个
-`RECIPE_AISBENCH_BIN` 后才进入 `run.sh` 并启动服务。
+`RECIPE_AISBENCH_BIN` 和 `RECIPE_AISBENCH_SOURCE` 后才进入 `run.sh` 并启动服务。
 Runtime Pod 通过集群内部 PyPI cache 下载 AISBench 依赖。
 
-生成的 evaluation 脚本负责准备自己的小数据和配置，调用固定入口，
-再由 `aisbench.py` 把公共指标写入 `RECIPE_STEP_RESULT_FILE`。
-
-两个 fixture 都携带少量离线 GSM8K smoke 数据。样本数和输出长度固定在最终中间态中，只用于
-证明流程可通；需要改变时重新生成 plan，不在 Runtime 引入兼容环境变量。
+plan 的 step inputs 声明 ModelScope dataset ID、AISBench dataset/request config 名称、
+`num_prompts` 和推理参数。`aisbench.py` 把数据集下载到 PVC 上的 ModelScope cache，从固定
+AISBench commit 复制模板到当前 step artifact，再补全 endpoint、model 和数据路径；不会修改
+共享 AISBench source。两个 fixture 用 `num_prompts: 1` 做 smoke，仓库不再复制 GSM8K 数据或
+Python 配置模板。
 
 ## 保留的两个 fixture
 
@@ -230,12 +297,16 @@ scripts/recipe_ci/run.sh
 无 NPU controller checkout 源码
   -> 解析 node_count / npu_per_node
   -> render_lws.py 渲染并创建 LeaderWorkerSet
+  -> 在 15 分钟总期限内一次等待全部 Pod 创建并 Ready
   -> Pod 通过 run_lws.sh 准备或复用共享 AISBench cache
   -> 所有 Pod 准备完成后进入通用 run.sh
   -> Pod 将退出码、artifact 和 plog 写入共享 PVC
-  -> 第一个失败后最多等待 300 秒，让其他节点完成 stop/cleanup/outcome
-  -> 删除 LWS，打包日志
+  -> 第一个失败后最多等待 120 秒，让其他节点完成 stop/cleanup/outcome
+  -> 固定采集 K8s 诊断，删除 LWS，打包 artifact
 ```
+
+CI job 总超时为 180 分钟；Pod 内共享 30 分钟启动期限和 120 分钟执行期限。单个 step 的
+实际 timeout 是其 plan 声明与剩余执行期限的较小值，避免多个阶段各自重新获得完整超时。
 
 Pod 按 `plan.resources.npu_per_node` 申请 `huawei.com/ascend-1980`，并由当前 cluster profile
 选择 A2B4 节点、night toleration、hostNetwork、PVC 和 runtime image。这些基础设施策略只在
@@ -244,7 +315,9 @@ workflow/template 中，不进入 plan 或 Runtime core。相同 run 的 Pod 通
 
 artifact bundle 优先上传 OBS。只有 OBS step 没有成功时才执行
 `actions/upload-artifact` 作为 GitHub fallback；任一上传失败只产生 warning，不覆盖模型测试
-结论。共享 PVC 中的本次 run 目录只在 OBS 或 GitHub 至少一处上传成功后删除。
+结论。成功和失败使用相同日志策略：固定保留 `artifacts/`、`plogs/`、`pod-status/`，以及
+渲染值、LWS/Pod 最终 YAML 和 namespace events；controller step 输出和 Pod stdout 只实时显示
+在 GitHub，不再重复保存。共享 PVC 中的本次 run 目录只在 OBS 或 GitHub 至少一处上传成功后删除。
 
 PR job 只运行同仓库分支，fork PR 不接触集群凭据。当前不包含 nightly 自动触发。
 

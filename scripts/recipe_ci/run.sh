@@ -123,8 +123,8 @@ python3 -u "$SCRIPT_DIR/runner.py" \
     --node-id "$node_id" \
     --vllm-ascend-root "${VLLM_ASCEND_ROOT:-/vllm-workspace/vllm-ascend}" \
     --control-port "${RECIPE_CI_CONTROL_PORT:-29599}" \
-    --startup-timeout-seconds "${RECIPE_CI_STARTUP_TIMEOUT_SECONDS:-3600}" \
-    --run-timeout-seconds "${RECIPE_CI_RUN_TIMEOUT_SECONDS:-14400}" \
+    --startup-timeout-seconds "${RECIPE_CI_STARTUP_TIMEOUT_SECONDS:-1800}" \
+    --run-timeout-seconds "${RECIPE_CI_RUN_TIMEOUT_SECONDS:-7200}" \
     --artifact-root "$artifact_root" &
 runner_pid=$!
 

@@ -109,13 +109,8 @@ IP 补充 `NO_PROXY`。
 ## AISBench 阶段
 
 plan 中声明的 completion、accuracy 和 performance stages 会全部执行。LWS 入口会在
-`run.sh` 前准备或复用共享 AISBench cache。这个轻量 plan 自带 8 条离线 GSM8K
-格式样本，evaluation 会把它链接到当前步骤的 artifact 目录，不会下载数据集，也不会
-修改共享的 AISBench 安装或缓存。
-
-plan 内的 `aisbench/models/vllm_api_general_chat.py` 和 `vllm_api_stream_chat.py` 是
-Recipe 转换产物，分别供精度和性能评测使用。evaluation 会根据当前 endpoint、模型路径和
-served model 将占位符渲染到 artifact 目录，无需修改 AISBench 安装目录。模型配置、
-数据集和样本数已经固定在这个最终执行中间态中；需要改变时应重新生成 plan，而不是在
-执行阶段通过兼容环境变量覆盖。评测命令输出和 AISBench 产物都会写到该节点对应的
-stage artifact 目录。
+`run.sh` 前准备或复用共享 AISBench cache。plan 的 step inputs 分别声明 accuracy 和
+performance 使用的 ModelScope dataset ID、AISBench dataset/request config 以及
+`num_prompts`。运行时从固定 AISBench commit 复制模板到 step artifact，补全当前 endpoint、
+模型和数据路径；数据集复用 PVC 上的 ModelScope cache，不修改 AISBench source。当前
+`num_prompts: 1` 只用于 smoke，需要改变时应重新生成 plan。

@@ -54,6 +54,7 @@ class ScriptStep:
     id: str
     script: str
     timeout_seconds: int
+    inputs: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,7 @@ def _decode_step(value: dict[str, Any]) -> ScriptStep:
         id=value["id"],
         script=value["script"],
         timeout_seconds=value.get("timeout_seconds", 300),
+        inputs=_mapping(value.get("inputs", {}), f"step {value['id']}.inputs"),
     )
 
 

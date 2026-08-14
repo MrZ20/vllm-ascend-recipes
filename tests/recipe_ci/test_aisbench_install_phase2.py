@@ -206,6 +206,10 @@ exit 1
             Path(output["RECIPE_AISBENCH_BIN"]),
             self.cache_root / expected_key / "venv/bin/ais_bench",
         )
+        self.assertEqual(
+            Path(output["RECIPE_AISBENCH_SOURCE"]),
+            self.cache_root / expected_key / "source",
+        )
         self.assertNotIn("RECIPE_AISBENCH_ROOT", output)
         self.assertTrue(os.access(output["RECIPE_AISBENCH_BIN"], os.X_OK))
         self.assertEqual(

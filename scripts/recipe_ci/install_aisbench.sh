@@ -95,6 +95,7 @@ write_environment() {
     {
         printf 'RECIPE_AISBENCH_BIN=%s\n' "$command_path"
         printf 'RECIPE_AISBENCH_CACHE_KEY=%s\n' "$cache_key"
+        printf 'RECIPE_AISBENCH_SOURCE=%s\n' "$source_directory"
     } > "$env_file"
 }
 

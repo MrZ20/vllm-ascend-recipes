@@ -28,14 +28,13 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertEqual(set(value["on"]), {"pull_request", "workflow_dispatch"})
         self.assertEqual(value["on"]["pull_request"]["branches"], ["main"])
         self.assertEqual(value["on"]["workflow_dispatch"], "")
-        self.assertEqual(set(value["jobs"]), {"recipe-ci"})
-        job = value["jobs"]["recipe-ci"]
+        self.assertEqual(set(value["jobs"]), {"verify"})
+        job = value["jobs"]["verify"]
         self.assertEqual(job["uses"], "./.github/workflows/_recipe_verify_multi_node.yaml")
         self.assertEqual(
             job["strategy"]["matrix"]["plan"],
             [
                 "configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml",
-                "configs/recipe_ci/plans/qwen3-30b-a3b-dp-2n2c/plan.yaml",
             ],
         )
         self.assertEqual(job["with"], {"plan": "${{ matrix.plan }}"})
@@ -76,9 +75,9 @@ class MultiNodeWorkflowTests(unittest.TestCase):
             value["on"]["workflow_call"]["secrets"]["OBS_SK"]["required"],
             "false",
         )
-        self.assertEqual(set(value["jobs"]), {"recipe-ci"})
-        job = value["jobs"]["recipe-ci"]
-        self.assertEqual(job["container"]["image"], job["env"]["CONTROLLER_IMAGE"])
+        self.assertEqual(set(value["jobs"]), {"run"})
+        job = value["jobs"]["run"]
+        self.assertNotIn("CONTROLLER_IMAGE", job["env"])
         self.assertIn('"image": os.environ["RUNTIME_IMAGE"]', text)
         self.assertIn("kubectl apply", text)
         self.assertIn("kubectl delete", text)
@@ -95,13 +94,19 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertIn("linux-aarch64-a2b4-1", text)
         self.assertIn("vllm-ascend-vllm-ascend-recipes", text)
         self.assertIn("vllm-ascend-vllm-ascend-recipes-gy001", text)
-        self.assertIn("STARTUP_TIMEOUT_SECONDS: 3600", text)
-        self.assertIn("RUN_TIMEOUT_SECONDS: 14400", text)
+        self.assertEqual(job["timeout-minutes"], "180")
+        self.assertIn("POD_START_TIMEOUT_SECONDS: 900", text)
+        self.assertIn("STARTUP_TIMEOUT_SECONDS: 1800", text)
+        self.assertIn("RUN_TIMEOUT_SECONDS: 7200", text)
+        self.assertNotIn("/proc/sys/kernel/random/uuid", text)
+        self.assertIn('unique_suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"', text)
+        self.assertNotIn('lws_name="recipe-', text)
         self.assertNotIn("vars.RECIPE_CI_", text)
         self.assertNotIn("RECIPE_CI_MODEL_PATH", text)
         self.assertNotIn("RECIPE_CI_EVALUATION", text)
         self.assertNotIn("RECIPE_CI_A3_", text)
-        self.assertIn("/tmp/recipe-ci-pods.txt", text)
+        self.assertIn("/tmp/lws-pods.txt", text)
+        self.assertNotIn("/tmp/recipe-ci-pods.txt", text)
         self.assertIn('"$RECIPE_CI_RUN_ROOT/pod-status/node${index}.exit"', text)
         self.assertNotIn("state.terminated.exitCode", text)
         self.assertIn('for index in "${!pods[@]}"', text)
@@ -110,16 +115,30 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertIn('kubectl logs -f "$pod"', text)
         self.assertIn('> >(sed -u "s/^/[node${index}] /") 2>&1 &', text)
         self.assertIn('wait "$pid"', text)
-        self.assertIn("FAILURE_SETTLE_TIMEOUT_SECONDS: 300", text)
+        self.assertIn("FAILURE_SETTLE_TIMEOUT_SECONDS: 120", text)
         self.assertIn('failure_settle_deadline=""', text)
         self.assertIn('"$all_finished" == true', text)
         self.assertNotIn('node_failed=true', text)
         self.assertIn("waiting up to ${FAILURE_SETTLE_TIMEOUT_SECONDS}s", text)
         self.assertIn("id: run_recipe", text)
-        self.assertIn("--for=create --timeout=20m", text)
-        self.assertIn("--for=condition=Ready --timeout=20m", text)
+        self.assertIn('kubectl wait "${pod_resources[@]}"', text)
+        self.assertIn('--for=create --timeout="${remaining}s"', text)
+        self.assertIn('--for=condition=Ready --timeout="${remaining}s"', text)
+        self.assertEqual(text.count('kubectl wait "${pod_resources[@]}"'), 2)
+        self.assertNotIn("--timeout=20m", text)
         self.assertNotIn("failure-diagnostics.log", text)
         self.assertNotIn('| sed -u "s/^/[node${index}] /"', text)
+        self.assertNotIn("controller-logs", text)
+        self.assertNotIn("pod-logs", text)
+        self.assertNotIn("/tmp/recipe-ci-node", text)
+        self.assertIn("Collect Kubernetes diagnostics", text)
+        self.assertIn("final-lws.yaml", text)
+        self.assertIn("final-pods.yaml", text)
+        self.assertIn("events.log", text)
+        self.assertLess(
+            text.index("Collect Kubernetes diagnostics"),
+            text.index("Delete LeaderWorkerSet"),
+        )
 
         # Pod placement, addresses, and visible devices are supplied by LWS/K8s,
         # rather than duplicated as per-node GitHub runner configuration.
@@ -139,8 +158,8 @@ class MultiNodeWorkflowTests(unittest.TestCase):
             "plan": "configs/recipe_ci/plans/deepseek-v2-lite-pd-2n2c/plan.yaml",
             "node_count": "4",
             "npu_per_node": "2",
-            "startup_timeout_seconds": "3600",
-            "run_timeout_seconds": "14400",
+            "startup_timeout_seconds": "1800",
+            "run_timeout_seconds": "7200",
             "pvc_name": "recipe-ci-pvc",
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -176,6 +195,8 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         leader = template["leaderTemplate"]["spec"]["containers"][0]
         worker = template["workerTemplate"]["spec"]["containers"][0]
         self.assertEqual(leader["command"], worker["command"])
+        self.assertEqual(leader["name"], "runner")
+        self.assertEqual(worker["name"], "runner")
         self.assertEqual(leader["command"][:2], ["bash", "-c"])
         self.assertIn("/scripts/recipe_ci/k8s/run_lws.sh", leader["command"][2])
         self.assertIn(
@@ -293,7 +314,8 @@ class MultiNodeWorkflowTests(unittest.TestCase):
             'mv "$aisbench_environment_tmp" "$aisbench_environment"', adapter
         )
         self.assertIn(
-            "export RECIPE_AISBENCH_BIN RECIPE_AISBENCH_CACHE_KEY", adapter
+            "export RECIPE_AISBENCH_BIN RECIPE_AISBENCH_CACHE_KEY RECIPE_AISBENCH_SOURCE",
+            adapter,
         )
         self.assertLess(
             adapter.index("install_aisbench.sh"),
@@ -327,7 +349,12 @@ class MultiNodeWorkflowTests(unittest.TestCase):
         self.assertNotIn("LWS_", text)
         self.assertIn("LWS_LEADER_ADDRESS", adapter)
         self.assertIn("LWS_WORKER_INDEX", adapter)
-        self.assertIn("RECIPE_CI_STARTUP_TIMEOUT_SECONDS:-300", adapter)
+        self.assertIn("RECIPE_CI_STARTUP_TIMEOUT_SECONDS:-1800", adapter)
+        self.assertEqual(adapter.count("startup_deadline="), 1)
+        self.assertIn(
+            "RECIPE_CI_STARTUP_TIMEOUT_SECONDS=$(remaining_startup_seconds)",
+            adapter,
+        )
         self.assertIn("awk 'NR == 1 {print $1}' || true", adapter)
         self.assertIn("Waiting for LWS DNS", adapter)
         self.assertIn("export RECIPE_CI_NODE_INDEX=$LWS_WORKER_INDEX", adapter)

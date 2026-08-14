@@ -24,23 +24,22 @@ defaults:
     shell: bash -el {0}
 
 concurrency:
-  group: recipe-ci-a2b4-k8s-multi-node
+  group: multi-node-a2b4-k8s
   cancel-in-progress: false
 
 jobs:
-  recipe-ci:
+  run:
     name: ${{ inputs.plan }}
     runs-on: linux-aarch64-a2b4-1
     env:
-      CONTROLLER_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu-py3.12
       RUNTIME_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:v0.23.0rc1
-      STARTUP_TIMEOUT_SECONDS: 3600
-      RUN_TIMEOUT_SECONDS: 14400
-      FAILURE_SETTLE_TIMEOUT_SECONDS: 300
+      POD_START_TIMEOUT_SECONDS: 900
+      STARTUP_TIMEOUT_SECONDS: 1800
+      RUN_TIMEOUT_SECONDS: 7200
+      FAILURE_SETTLE_TIMEOUT_SECONDS: 120
       PVC_NAME: vllm-ascend-vllm-ascend-recipes-gy001
-    # Leave time for Pod scheduling, cleanup, and artifact upload around the
-    # default one-hour startup plus four-hour coordinated run timeout.
-    timeout-minutes: 360
+    # 15m scheduling + 30m startup + 120m execution, with cleanup/upload margin.
+    timeout-minutes: 180
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu-py3.12
       env:
@@ -54,12 +53,16 @@ jobs:
         run: |
           set -euo pipefail
           bundle=/tmp/recipe-ci-bundle
-          mkdir -p "$bundle/controller-logs" "$bundle/pod-logs"
+          mkdir -p "$bundle/k8s"
           plan_name=$(basename "$(dirname "$PLAN")")
-          suffix=$(printf '%s' "$plan_name" | tr '[:upper:]_' '[:lower:]-' | cut -c1-32)
-          random_suffix=$(tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-6)
-          lws_name="recipe-${suffix}-${GITHUB_RUN_ID}-${random_suffix}"
-          lws_name=${lws_name:0:63}
+          plan_slug=$(printf '%s' "$plan_name" | tr '[:upper:]_' '[:lower:]-' | \
+            tr -cs 'a-z0-9-' '-' | sed 's/^-*//; s/-*$//')
+          [[ -n "$plan_slug" ]] || plan_slug=plan
+          unique_suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          max_plan_length=$((63 - ${#unique_suffix} - 1))
+          plan_slug=${plan_slug:0:max_plan_length}
+          plan_slug=${plan_slug%-}
+          lws_name="${plan_slug}-${unique_suffix}"
           run_root="/root/.cache/recipe-ci/$lws_name"
 
           {
@@ -68,7 +71,7 @@ jobs:
             echo "RECIPE_CI_BUNDLE=$bundle"
             echo "RECIPE_CI_RUN_ROOT=$run_root"
           } >> "$GITHUB_ENV"
-          echo "artifact_name=recipe-ci-${plan_name}-${GITHUB_RUN_ID}-${random_suffix}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${plan_name}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
           echo "Initialized diagnostics for $PLAN"
 
       - name: Decode kubeconfig
@@ -76,7 +79,6 @@ jobs:
           KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
         run: |
           set -euo pipefail
-          exec > >(tee -a "$RECIPE_CI_BUNDLE/controller-logs/decode-kubeconfig.log") 2>&1
           test -n "$KUBECONFIG_B64"
           printf '%s' "$KUBECONFIG_B64" | base64 -d > "$KUBECONFIG"
           chmod 600 "$KUBECONFIG"
@@ -84,7 +86,6 @@ jobs:
       - name: Check cluster access
         run: |
           set -euo pipefail
-          exec > >(tee -a "$RECIPE_CI_BUNDLE/controller-logs/check-cluster-access.log") 2>&1
           kubectl --kubeconfig "$KUBECONFIG" get namespace "$NAMESPACE"
 
       - name: Checkout recipes
@@ -93,7 +94,6 @@ jobs:
       - name: Install controller dependencies
         run: |
           set -euo pipefail
-          exec > >(tee -a "$RECIPE_CI_BUNDLE/controller-logs/install-dependencies.log") 2>&1
           python3 -m pip install pyyaml --quiet
 
       - name: Prepare run identity and stage source
@@ -102,7 +102,6 @@ jobs:
           PLAN: ${{ inputs.plan }}
         run: |
           set -euo pipefail
-          exec > >(tee -a "$RECIPE_CI_BUNDLE/controller-logs/prepare.log") 2>&1
           read -r node_count npu_per_node < <(
             PLAN_PATH="$PLAN" PYTHONPATH=scripts/recipe_ci python3 - <<'PY'
           import os
@@ -115,21 +114,21 @@ jobs:
           PY
           )
           case "$RECIPE_CI_RUN_ROOT" in
-            /root/.cache/recipe-ci/recipe-*) ;;
+            /root/.cache/recipe-ci/*) ;;
             *) echo "Unsafe run root: $RECIPE_CI_RUN_ROOT" >&2; exit 1 ;;
           esac
           rm -rf -- "$RECIPE_CI_RUN_ROOT"
           mkdir -p "$RECIPE_CI_RUN_ROOT/source" "$RECIPE_CI_RUN_ROOT/pod-status"
           cp -a "$GITHUB_WORKSPACE"/. "$RECIPE_CI_RUN_ROOT/source/"
 
-          : > /tmp/recipe-ci-pods.txt
+          : > /tmp/lws-pods.txt
           for ((index = 0; index < node_count; index++)); do
             if [[ $index -eq 0 ]]; then
               pod="${LWS_NAME}-0"
             else
               pod="${LWS_NAME}-0-${index}"
             fi
-            echo "$pod" >> /tmp/recipe-ci-pods.txt
+            echo "$pod" >> /tmp/lws-pods.txt
           done
 
           {
@@ -142,7 +141,6 @@ jobs:
           PLAN: ${{ inputs.plan }}
         run: |
           set -euo pipefail
-          exec > >(tee -a "$RECIPE_CI_BUNDLE/controller-logs/render-and-launch.log") 2>&1
           python3 - <<'PY'
           import json
           import os
@@ -173,19 +171,25 @@ jobs:
       - name: Wait for LWS pods to start
         run: |
           set -euo pipefail
-          exec > >(tee -a "$RECIPE_CI_BUNDLE/controller-logs/wait-for-pods.log") 2>&1
-          while read -r pod; do
-            kubectl wait pod/"$pod" -n "$NAMESPACE" --for=create --timeout=20m
-            kubectl wait pod/"$pod" -n "$NAMESPACE" \
-              --for=condition=Ready --timeout=20m
-          done < /tmp/recipe-ci-pods.txt
+          mapfile -t pods < /tmp/lws-pods.txt
+          pod_resources=()
+          for pod in "${pods[@]}"; do
+            pod_resources+=("pod/$pod")
+          done
+          deadline=$((SECONDS + POD_START_TIMEOUT_SECONDS))
+          remaining=$((deadline - SECONDS))
+          kubectl wait "${pod_resources[@]}" -n "$NAMESPACE" \
+            --for=create --timeout="${remaining}s"
+          remaining=$((deadline - SECONDS))
+          ((remaining > 0)) || { echo "Pod startup timed out" >&2; exit 1; }
+          kubectl wait "${pod_resources[@]}" -n "$NAMESPACE" \
+            --for=condition=Ready --timeout="${remaining}s"
 
       - name: Stream logs and wait for Recipe CI
         id: run_recipe
         run: |
           set -euo pipefail
-          exec > >(tee -a "$RECIPE_CI_BUNDLE/controller-logs/recipe-ci.log") 2>&1
-          mapfile -t pods < /tmp/recipe-ci-pods.txt
+          mapfile -t pods < /tmp/lws-pods.txt
           pids=()
           # shellcheck disable=SC2329  # Invoked by the EXIT trap.
           stop_streams() {
@@ -234,10 +238,6 @@ jobs:
 
           stop_streams
           trap - EXIT
-          for index in "${!pods[@]}"; do
-            kubectl logs "${pods[$index]}" -n "$NAMESPACE" \
-              > "/tmp/recipe-ci-node${index}.log" 2>&1 || true
-          done
 
           failed=0
           for index in "${!pods[@]}"; do
@@ -252,6 +252,30 @@ jobs:
           done
           exit "$failed"
 
+      - name: Collect Kubernetes diagnostics
+        if: always() && steps.prepare.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set -u
+          k8s_directory="$RECIPE_CI_BUNDLE/k8s"
+          mkdir -p "$k8s_directory"
+          cp "$RECIPE_CI_RUN_ROOT/lws.yaml" "$k8s_directory/lws.yaml" 2>/dev/null || true
+          cp "$RECIPE_CI_RUN_ROOT/lws-values.json" "$k8s_directory/lws-values.json" 2>/dev/null || true
+          kubectl get leaderworkerset "$LWS_NAME" -n "$NAMESPACE" -o yaml \
+            > "$k8s_directory/final-lws.yaml" 2>&1 || true
+          kubectl get pods -n "$NAMESPACE" -l "recipe-ci-run=$LWS_NAME" -o yaml \
+            > "$k8s_directory/final-pods.yaml" 2>&1 || true
+          : > "$k8s_directory/events.log"
+          kubectl get events -n "$NAMESPACE" \
+            --field-selector "involvedObject.kind=LeaderWorkerSet,involvedObject.name=$LWS_NAME" \
+            --sort-by=.lastTimestamp >> "$k8s_directory/events.log" 2>&1 || true
+          while read -r pod; do
+            kubectl get events -n "$NAMESPACE" \
+              --field-selector "involvedObject.kind=Pod,involvedObject.name=$pod" \
+              --sort-by=.lastTimestamp >> "$k8s_directory/events.log" 2>&1 || true
+          done < /tmp/lws-pods.txt
+
       - name: Delete LeaderWorkerSet
         if: always() && steps.prepare.outcome == 'success'
         continue-on-error: true
@@ -265,17 +289,13 @@ jobs:
         run: |
           set -euo pipefail
           bundle=${RECIPE_CI_BUNDLE:-/tmp/recipe-ci-bundle}
-          mkdir -p "$bundle/controller-logs" "$bundle/pod-logs"
+          mkdir -p "$bundle/k8s"
           if [[ -n "${RECIPE_CI_RUN_ROOT:-}" ]]; then
             for directory in artifacts plogs pod-status; do
               [[ -d "$RECIPE_CI_RUN_ROOT/$directory" ]] && \
                 cp -a "$RECIPE_CI_RUN_ROOT/$directory" "$bundle/"
             done
           fi
-          for ((index = 0; index < ${RECIPE_CI_NODE_COUNT:-0}; index++)); do
-            cp "/tmp/recipe-ci-node${index}.log" \
-              "$bundle/pod-logs/node${index}.log" 2>/dev/null || true
-          done
           tar -czf /tmp/recipe-ci-bundle.tar.gz -C /tmp recipe-ci-bundle
 
       - name: Upload Recipe CI bundle to OBS
@@ -287,7 +307,7 @@ jobs:
         with:
           access_key: ${{ secrets.OBS_AK }}
           secret_key: ${{ secrets.OBS_SK }}
-          name: ${{ steps.initialize.outputs.artifact_name || format('recipe-ci-diagnostics-{0}', github.run_id) }}
+          name: ${{ steps.initialize.outputs.artifact_name || format('diagnostics-{0}', github.run_id) }}
           path: /tmp/recipe-ci-bundle.tar.gz
           retention-days: 14
 
@@ -298,7 +318,7 @@ jobs:
         timeout-minutes: 5
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.initialize.outputs.artifact_name || format('recipe-ci-diagnostics-{0}', github.run_id) }}
+          name: ${{ steps.initialize.outputs.artifact_name || format('diagnostics-{0}', github.run_id) }}
           path: /tmp/recipe-ci-bundle.tar.gz
           if-no-files-found: error
           retention-days: 14
@@ -310,6 +330,6 @@ jobs:
         timeout-minutes: 5
         run: |
           case "$RECIPE_CI_RUN_ROOT" in
-            /root/.cache/recipe-ci/recipe-*) rm -rf -- "$RECIPE_CI_RUN_ROOT" ;;
+            /root/.cache/recipe-ci/*) rm -rf -- "$RECIPE_CI_RUN_ROOT" ;;
             *) echo "Refusing to remove unsafe path: $RECIPE_CI_RUN_ROOT" >&2; exit 1 ;;
           esac

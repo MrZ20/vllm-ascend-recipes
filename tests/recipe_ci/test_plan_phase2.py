@@ -90,6 +90,9 @@ class PlanTests(unittest.TestCase):
                             "id": "accuracy",
                             "script": "evaluations/accuracy.sh",
                             "timeout_seconds": 600,
+                            "inputs": {
+                                "aisbench": {"num_prompts": 4},
+                            },
                         }
                     ],
                 },
@@ -152,6 +155,11 @@ class PlanTests(unittest.TestCase):
         )
         self.assertEqual(plan.stages[0].failure_category, "check_failed")
         self.assertEqual(plan.stages[1].steps[0].timeout_seconds, 600)
+        self.assertEqual(
+            plan.stages[1].steps[0].inputs,
+            {"aisbench": {"num_prompts": 4}},
+        )
+        self.assertEqual(plan.stages[0].steps[0].inputs, {})
 
     def test_loader_trusts_converter_validated_topology_and_paths(self) -> None:
         data = copy.deepcopy(self.plan_data)

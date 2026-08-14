@@ -87,62 +87,43 @@ class PlanTests(unittest.TestCase):
             '--data-parallel-address "$RECIPE_NODE_0_IP"', headless_run
         )
 
-    def test_examples_keep_aisbench_model_config_in_the_plan(self) -> None:
+    def test_examples_declare_aisbench_inputs_without_vendored_configs(self) -> None:
         for example in (
             EXAMPLE,
             GENERIC_DP_EXAMPLE,
         ):
-            accuracy_config = example / "aisbench/models/vllm_api_general_chat.py"
-            performance_config = example / "aisbench/models/vllm_api_stream_chat.py"
-            accuracy_script = (example / "evaluations/accuracy.sh").read_text(
-                encoding="utf-8"
-            )
-            performance_script = (example / "evaluations/performance.sh").read_text(
-                encoding="utf-8"
-            )
+            plan = load_plan(example / "plan.yaml")
+            accuracy = plan.stages[1].steps[0]
+            performance = plan.stages[2].steps[0]
+            run_script = (example / "evaluations/run_aisbench.sh").read_text()
 
-            self.assertTrue(accuracy_config.is_file())
-            self.assertTrue(performance_config.is_file())
-            self.assertIn("$RECIPE_PLAN_DIR/aisbench", accuracy_script)
-            self.assertIn("vllm_api_general_chat", accuracy_script)
-            self.assertIn("$RECIPE_PLAN_DIR/aisbench", performance_script)
-            self.assertIn("vllm_api_stream_chat", performance_script)
-            for config in (accuracy_config, performance_config):
-                text = config.read_text(encoding="utf-8")
-                self.assertNotIn("import os", text)
-                self.assertIn("path=__RECIPE_MODEL_PATH__", text)
-                self.assertIn("host_port=__RECIPE_ENDPOINT_PORT__", text)
-            self.assertIn("render-model-config", accuracy_script)
-            self.assertIn("render-model-config", performance_script)
+            self.assertEqual(accuracy.script, "evaluations/run_aisbench.sh")
+            self.assertEqual(performance.script, "evaluations/run_aisbench.sh")
+            self.assertEqual(
+                accuracy.inputs["aisbench"]["request_conf"],
+                "vllm_api_general_chat",
+            )
+            self.assertEqual(
+                performance.inputs["aisbench"]["request_conf"],
+                "vllm_api_stream_chat",
+            )
+            self.assertIn("RECIPE_STEP_INPUT_FILE", run_script)
+            self.assertFalse(any((example / "aisbench").rglob("*.py")))
 
-    def test_small_plans_carry_isolated_offline_gsm8k_fixtures(self) -> None:
+    def test_small_plans_use_modelscope_datasets_and_prompt_limit(self) -> None:
         for example in (EXAMPLE, GENERIC_DP_EXAMPLE):
-            dataset = example / "aisbench/datasets/gsm8k"
-            train_rows = [
-                json.loads(line)
-                for line in (dataset / "train.jsonl").read_text().splitlines()
-            ]
-            test_rows = [
-                json.loads(line)
-                for line in (dataset / "test.jsonl").read_text().splitlines()
-            ]
+            plan = load_plan(example / "plan.yaml")
+            accuracy = plan.stages[1].steps[0].inputs["aisbench"]
+            performance = plan.stages[2].steps[0].inputs["aisbench"]
 
-            self.assertGreaterEqual(len(train_rows), 1)
-            self.assertEqual(len(test_rows), 8)
-            for row in [*train_rows, *test_rows]:
-                self.assertEqual(set(row), {"question", "answer"})
-                self.assertIn("#### ", row["answer"])
-
-            prepare = (example / "evaluations/prepare_gsm8k.sh").read_text()
-            self.assertIn("$RECIPE_STEP_ARTIFACT_DIR/ais_bench", prepare)
-            self.assertIn("AIS_BENCH_DATASETS_CACHE", prepare)
-            self.assertNotIn("$RECIPE_AISBENCH_ROOT/ais_bench", prepare)
-            for script_name in ("accuracy.sh", "performance.sh"):
-                script = (example / "evaluations" / script_name).read_text()
-                self.assertIn(
-                    'source "$RECIPE_PLAN_DIR/evaluations/prepare_gsm8k.sh"',
-                    script,
-                )
+            self.assertEqual(accuracy["dataset_path"], "vllm-ascend/gsm8k-lite")
+            self.assertEqual(
+                performance["dataset_path"],
+                "vllm-ascend/GSM8K-in3500-bs400",
+            )
+            self.assertEqual(accuracy["num_prompts"], 1)
+            self.assertEqual(performance["num_prompts"], 1)
+            self.assertFalse(any((example / "aisbench").rglob("*.jsonl")))
 
     def test_hosts_must_match_plan_nodes(self) -> None:
         plan = load_plan(EXAMPLE / "plan.yaml")
@@ -313,6 +294,14 @@ class LocalRunnerTests(unittest.TestCase):
                     "value"
                 ],
                 1,
+            )
+            self.assertEqual(
+                json.loads(
+                    (
+                        leader_artifacts / "custom-stage/custom/input.json"
+                    ).read_text(encoding="utf-8")
+                ),
+                {"fixture": {"value": 7}},
             )
             self.assertEqual(leader_result["status"], "passed")
             self.assertEqual(worker_result["status"], "passed")
@@ -772,6 +761,7 @@ HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
                             "id": "custom",
                             "script": "evaluations/custom.sh",
                             "timeout_seconds": 5,
+                            "inputs": {"fixture": {"value": 7}},
                         }
                     ],
                 },
