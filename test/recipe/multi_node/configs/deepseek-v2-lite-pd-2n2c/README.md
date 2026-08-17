@@ -1,0 +1,127 @@
+# DeepSeek-V2-Lite P/D 双节点四卡验证
+
+这个手工中间态用例用于打通第一阶段主链路：两台机器分别承担 Prefill 和 Decode，
+每台机器由 vLLM Ascend 的 `launch_online_dp.py` 启动两个 TP1 实例，因此每节点使用
+2 张 NPU，总计 4 卡。所有后端就绪后，Prefill 节点启动上游 P/D Proxy，再依次执行
+plan 中声明的 completion、accuracy 和 performance stages。
+
+该用例不依赖 Recipe 文档转换、Kubernetes 或共享文件系统。
+
+## 运行镜像契约
+
+使用 vLLM Ascend 官方运行镜像。镜像除已安装的 vLLM 和 vLLM Ascend 外，还必须保留
+完整源码目录：
+
+```text
+/vllm-workspace/vllm-ascend/
+├── examples/external_online_dp/launch_online_dp.py
+└── examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+```
+
+这些工具由镜像提供，本仓库不复制它们，也不会在执行时下载 vLLM Ascend 源码。
+
+## 第一次本地验证：启动镜像后 clone
+
+下面的动作需要在两台装有 NPU 的物理机上各执行一次。先把本次修改提交并推送到可
+访问的分支；容器内 `git clone` 无法读取宿主机尚未推送的工作区修改。
+
+在两台机器的宿主机上启动相同版本的镜像，并将模型挂载到相同的容器路径。镜像名、
+宿主机模型路径按实际环境替换：
+
+```bash
+docker run --rm -it \
+  --privileged \
+  --network host \
+  --ipc host \
+  --shm-size 64g \
+  -v /path/on/host/DeepSeek-V2-Lite-W8A8:/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V2-Lite-W8A8:ro \
+  quay.io/ascend/vllm-ascend:v0.22.1rc1 \
+  bash
+```
+
+进入容器后，先确认镜像契约，再 clone 当前分支。使用 HTTPS 可以避免容器内缺少宿主机
+SSH 凭据：
+
+```bash
+test -f /vllm-workspace/vllm-ascend/examples/external_online_dp/launch_online_dp.py
+test -f /vllm-workspace/vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+
+cd /vllm-workspace
+git clone --branch <your-branch> --depth 1 \
+  https://github.com/MrZ20/vllm-ascend-recipes.git \
+  vllm-ascend-recipes
+cd /vllm-workspace/vllm-ascend-recipes
+```
+
+两台机器通过相同的 `MULTI_NODE_CLUSTER_IPS` 提供按 `node0,node1` 排列的集群地址。
+`node0` 的角色是 Prefill，并作为默认控制面 leader；这里的默认值来自节点顺序，不需要
+在 plan 中重复声明。
+
+先检查中间态结构，不会检查 NPU 或启动服务：
+
+```bash
+MULTI_NODE_PLAN=test/recipe/multi_node/configs/deepseek-v2-lite-pd-2n2c/plan.yaml \
+MULTI_NODE_VALIDATE_ONLY=true test/recipe/multi_node/scripts/run.sh
+```
+
+Prefill 机器作为 `node0` 执行：
+
+```bash
+export MULTI_NODE_PLAN=test/recipe/multi_node/configs/deepseek-v2-lite-pd-2n2c/plan.yaml
+export MULTI_NODE_CLUSTER_IPS="<node0_ip>,<node1_ip>"
+export MULTI_NODE_INTERFACE="<local_interface>"
+export MULTI_NODE_NODE_INDEX=0
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+test/recipe/multi_node/scripts/run.sh
+```
+
+Decode 机器作为 `node1` 执行：
+
+```bash
+export MULTI_NODE_PLAN=test/recipe/multi_node/configs/deepseek-v2-lite-pd-2n2c/plan.yaml
+export MULTI_NODE_CLUSTER_IPS="<node0_ip>,<node1_ip>"
+export MULTI_NODE_INTERFACE="<local_interface>"
+export MULTI_NODE_NODE_INDEX=1
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+test/recipe/multi_node/scripts/run.sh
+```
+
+两边的启动先后没有要求。框架默认使用
+`/vllm-workspace/vllm-ascend`；非标准镜像可通过 `VLLM_ASCEND_ROOT` 覆盖。
+每节点只消费候选列表的前两张卡；卡号需按两台机器各自的 `npu-smi info` 结果选择。
+框架不会清理或改写任何 `http_proxy`、`https_proxy`、`ftp_proxy` 环境变量，只为集群
+IP 补充 `NO_PROXY`。
+
+需要放通节点间通信，至少包括协调端口 `29599`、服务端口 `7100-7101`、DP RPC 端口
+`12321`、Mooncake 端口 `30000/30200` 和 Proxy 端口 `38085`。
+
+成功或失败后，各节点都会清理自己启动的进程。日志默认位于：
+
+```text
+/tmp/multi-node/deepseek-v2-lite-pd-2n2c/
+├── node0/
+│   ├── service.log
+│   ├── servers/
+│   │   ├── rank-0.log
+│   │   └── rank-1.log
+│   ├── gateway.log
+│   └── completion/completion.log
+└── node1/
+    ├── service.log
+    └── servers/
+        ├── rank-0.log
+        └── rank-1.log
+```
+
+`service.log` 记录 external-DP launcher 自身的输出和 worker 退出错误；每个
+`vllm serve` 的完整输出按 DP rank 分别写入 `servers/rank-<rank>.log`，不会再把同一节点的
+多个 rank 交错到一份服务日志中。
+
+## AISBench 阶段
+
+plan 中声明的 completion、accuracy 和 performance stages 会全部执行。LWS 入口会在
+`run.sh` 前准备或复用共享 AISBench cache。plan 的 step inputs 分别声明 accuracy 和
+performance 使用的 ModelScope dataset ID、AISBench dataset/request config 以及
+`num_prompts`。运行时从固定 AISBench package 复制模板到 step artifact，补全当前 endpoint、
+模型和数据路径；数据集复用 PVC 上的 ModelScope cache，不修改 AISBench source。当前
+`num_prompts: 1` 只用于 smoke，需要改变时应重新生成 plan。
