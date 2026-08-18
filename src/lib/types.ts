@@ -67,6 +67,11 @@ export interface ScenarioStep {
   config_values?: Record<string, { enabled: string; disabled: string }>;
 }
 
+export interface ScenarioScript {
+  language: string;
+  content: string;
+}
+
 export interface ExtraConfigItem {
   key: string;
   label: string;
@@ -84,8 +89,7 @@ export interface Scenario {
   precision: string;
   deployment: string;
   case: string;
-  tags?: string[];
-  strategy?: string;
+  scripts?: Record<string, ScenarioScript>;
   steps: ScenarioStep[];
   default_configs?: string[];
   config_params?: Record<string, ConfigParam>;

@@ -359,8 +359,6 @@ scenarios:
   precision: W8A8
   deployment: 单节点
   case: 多卡
-  tags: [a2-single]
-  strategy: single_node_A2
   steps:
   - title: 启动服务（Qwen3.5-27B-w8a8）
     content: |-
@@ -405,8 +403,6 @@ scenarios:
   precision: W8A8
   deployment: 单节点
   case: 多卡
-  tags: [a3-single]
-  strategy: single_node_A3
   steps:
   - title: 启动服务（Qwen3.5-27B-w8a8，满配 16 NPU）
     content: |-
@@ -449,8 +445,6 @@ scenarios:
   precision: BF16
   deployment: 单节点
   case: 多卡
-  tags: [a3-single]
-  strategy: single_node_A3
   steps:
   - title: 启动服务（Qwen3.5-27B BF16）
     content: |-
@@ -482,8 +476,6 @@ scenarios:
   precision: W8A8
   deployment: 多节点 PD 分离
   case: 1P1D（1 个 Prefill 节点 + 1 个 Decode 节点）
-  tags: [pd-multinode]
-  strategy: pd_cluster
   steps:
   - title: 拓扑（1P1D，每节点 TP=2 + DP=8）
     content: |-
@@ -627,8 +619,6 @@ scenarios:
   precision: W8A8
   deployment: 单节点
   case: 300I DUO(TP)
-  tags: [310p-single]
-  strategy: single_node_310p
   steps:
   - title: 启动服务
     content: |-

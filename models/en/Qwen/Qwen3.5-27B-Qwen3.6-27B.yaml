@@ -359,8 +359,6 @@ scenarios:
   precision: W8A8
   deployment: Single-Node
   case: Multi Card
-  tags: [a2-single]
-  strategy: single_node_A2
   steps:
   - title: Start the server (Qwen3.5-27B-w8a8)
     content: |-
@@ -405,8 +403,6 @@ scenarios:
   precision: W8A8
   deployment: Single-Node
   case: Multi Card
-  tags: [a3-single]
-  strategy: single_node_A3
   steps:
   - title: Start the server (Qwen3.5-27B-w8a8, full 16 NPUs)
     content: |-
@@ -449,8 +445,6 @@ scenarios:
   precision: BF16
   deployment: Single-Node
   case: Multi Card
-  tags: [a3-single]
-  strategy: single_node_A3
   steps:
   - title: Start the server (Qwen3.5-27B BF16)
     content: |-
@@ -482,8 +476,6 @@ scenarios:
   precision: W8A8
   deployment: Multi-Node PD Separation
   case: 1P1D (1 Prefill node + 1 Decode node)
-  tags: [pd-multinode]
-  strategy: pd_cluster
   steps:
   - title: Layout (1P1D, TP=2 + DP=8 per node)
     content: |-
@@ -627,8 +619,6 @@ scenarios:
   precision: W8A8
   deployment: Single-Node
   case: 300I DUO (TP)
-  tags: [310p-single]
-  strategy: single_node_310p
   steps:
   - title: Start the server
     content: |-

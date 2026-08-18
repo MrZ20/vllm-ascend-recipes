@@ -101,6 +101,7 @@ compatible_strategies:
   - single_node_A3
   - single_node_A2
   - single_node_310p
+  - multi_node_dp
 
 hardware_overrides: {}
 strategy_overrides: {}
@@ -423,11 +424,112 @@ env_setup:
       更多详情请参考[安装指南](https://docs.vllm.ai/projects/ascend/zh-cn/latest/installation.html)。
 scenarios:
 - npu: Atlas 800I A3
+  precision: bf16
+  deployment: non-pd
+  case: 2-node
+  config_params:
+    max_model_len:
+      default: 4096
+      type: number
+      description: "双节点验证的最大上下文长度"
+    max_num_seqs:
+      default: 8
+      type: number
+      description: "双节点验证的最大并发序列数"
+    gpu_memory_utilization:
+      default: 0.9
+      type: number
+      description: "双节点验证的 KV cache 显存比例"
+  scripts:
+    api-0:
+      language: bash
+      content: |-
+        export OMP_PROC_BIND=false
+        export OMP_NUM_THREADS=10
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export HCCL_BUFFSIZE=1024
+        export VLLM_USE_MODELSCOPE=true
+        export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"
+
+        vllm serve "$MODEL_PATH" \
+            --host "$API_NODE_0_IP" \
+            --port 7100 \
+            --served-model-name qwen3 \
+            --data-parallel-size 4 \
+            --data-parallel-size-local 2 \
+            --data-parallel-address "$API_NODE_0_IP" \
+            --data-parallel-rpc-port 12321 \
+            --tensor-parallel-size 1 \
+            --max-model-len {{max_model_len}} \
+            --max-num-seqs {{max_num_seqs}} \
+            --max-num-batched-tokens 4096 \
+            --gpu-memory-utilization {{gpu_memory_utilization}} \
+            --trust-remote-code \
+            --enable-expert-parallel \
+            --no-enable-prefix-caching \
+            --enforce-eager
+    headless-0:
+      language: bash
+      content: |-
+        export OMP_PROC_BIND=false
+        export OMP_NUM_THREADS=10
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export HCCL_BUFFSIZE=1024
+        export VLLM_USE_MODELSCOPE=true
+        export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"
+
+        vllm serve "$MODEL_PATH" \
+            --headless \
+            --data-parallel-size 4 \
+            --data-parallel-size-local 2 \
+            --data-parallel-start-rank 2 \
+            --data-parallel-address "$API_NODE_0_IP" \
+            --data-parallel-rpc-port 12321 \
+            --tensor-parallel-size 1 \
+            --max-model-len {{max_model_len}} \
+            --max-num-seqs {{max_num_seqs}} \
+            --max-num-batched-tokens 4096 \
+            --gpu-memory-utilization {{gpu_memory_utilization}} \
+            --trust-remote-code \
+            --enable-expert-parallel \
+            --no-enable-prefix-caching \
+            --enforce-eager
+    service-check:
+      language: bash
+      content: |-
+        response=$(curl --fail --silent --show-error \
+          "http://${API_NODE_0_IP}:7100/v1/completions" \
+          -H 'Content-Type: application/json' \
+          -d '{"model":"qwen3","prompt":"The future of AI is","max_tokens":50,"temperature":0}')
+
+        python3 -c 'import json, sys; assert json.load(sys.stdin)["choices"]' <<<"$response"
+  steps:
+  - title: 概述
+    content: |-
+      这是非 PD 分离的双节点 internal DP 拓扑：API 节点承载 DP rank 0、1，Headless
+      节点承载 DP rank 2、3；每节点使用 2 张 NPU，全局 DP=4、TP=1。API 节点的
+      7100 端口是唯一服务入口。
+
+      执行脚本前设置模型路径和 API 节点地址:
+
+      ```bash
+      export MODEL_PATH="${MODEL_PATH:-your_model_path}"
+      export API_NODE_0_IP="${API_NODE_0_IP:-<api_node_0_ip>}"
+      export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"
+      ```
+  - title: 启动 API 节点 0
+    content: |-
+      {{script:api-0}}
+  - title: 启动 Headless 节点 0
+    content: |-
+      {{script:headless-0}}
+  - title: 服务验证
+    content: |-
+      {{script:service-check}}
+- npu: Atlas 800I A3
   precision: W8A8
   deployment: 单节点-多卡
   case: 多卡
-  tags: [a3-single]
-  strategy: single_node_A3
   steps:
   - title: 启动服务
     content: |-
@@ -481,8 +583,6 @@ scenarios:
   precision: W8A8
   deployment: 单节点-多卡
   case: 多卡（A2）
-  tags: [a2-single]
-  strategy: single_node_A2
   steps:
   - title: 启动服务
     content: |-
@@ -535,8 +635,6 @@ scenarios:
   precision: W8A8
   deployment: 单节点-多卡
   case: 300I DUO(TP2)
-  tags: [310p-single]
-  strategy: single_node_310p
   steps:
   - title: 启动服务
     content: |-

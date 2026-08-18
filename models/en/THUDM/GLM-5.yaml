@@ -371,8 +371,6 @@ scenarios:
   precision: W4A8
   deployment: Single-Node
   case: Multi Card
-  tags: [a3-single]
-  strategy: single_node_A3
   steps:
   - title: Start the server
     content: |-
@@ -428,8 +426,6 @@ scenarios:
   precision: W8A8
   deployment: Single-Node
   case: Multi Card
-  tags: [a3-single]
-  strategy: single_node_A3
   steps:
   - title: Start the server
     content: |-
@@ -474,8 +470,6 @@ scenarios:
   precision: W4A8
   deployment: Single-Node
   case: Multi Card
-  tags: [a2-single]
-  strategy: single_node_A2
   steps:
   - title: Start the server
     content: |-
@@ -519,8 +513,6 @@ scenarios:
   precision: BF16
   deployment: Multi-Node
   case: Multi Node
-  tags: [multi-node-dp]
-  strategy: multi_node_dp
   steps:
   - title: Start the server
     content: |-
@@ -616,8 +608,6 @@ scenarios:
   precision: W4A8
   deployment: Multi-Node
   case: Multi Node
-  tags: [multi-node-dp]
-  strategy: multi_node_dp
   steps:
   - title: Start the server
     content: |-
@@ -716,8 +706,6 @@ scenarios:
   precision: W8A8
   deployment: Multi-Node PD Separation
   case: PD Separation
-  tags: [pd-multinode]
-  strategy: pd_cluster
   steps:
   - title: Overview
     content: |-

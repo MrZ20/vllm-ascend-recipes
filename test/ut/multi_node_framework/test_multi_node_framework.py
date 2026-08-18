@@ -33,6 +33,27 @@ from scripts.runner import (  # noqa: E402
 
 EXAMPLE = ROOT / "test/recipe/multi_node/configs/deepseek-v2-lite-pd-2n2c"
 GENERIC_DP_EXAMPLE = ROOT / "test/recipe/multi_node/configs/qwen3-30b-a3b-dp-2n2c"
+RECIPE_TEMPLATE_CASES = (
+    (
+        "DeepSeek/DeepSeek-V2-Lite-W8A8.yaml",
+        "pd",
+        "1p1d",
+        {
+            "prefill-0-template",
+            "decode-0-template",
+            "prefill-0-launch",
+            "decode-0-launch",
+            "gateway-0",
+            "service-check",
+        },
+    ),
+    (
+        "Qwen/Qwen3-30B-A3B.yaml",
+        "non-pd",
+        "2-node",
+        {"api-0", "headless-0", "service-check"},
+    ),
+)
 
 
 def free_port() -> int:
@@ -72,6 +93,74 @@ class RunnerProgressTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def test_examples_have_bilingual_recipe_templates(self) -> None:
+        for recipe_path, deployment, case, expected_scripts in RECIPE_TEMPLATE_CASES:
+            scenarios_by_language = {}
+            for language in ("en", "zh"):
+                recipe = yaml.safe_load(
+                    (ROOT / "models" / language / recipe_path).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                scenario = next(
+                    scenario
+                    for scenario in recipe["scenarios"]
+                    if scenario["deployment"] == deployment
+                    and scenario["case"] == case
+                )
+                self.assertEqual(set(scenario["scripts"]), expected_scripts)
+                scenarios_by_language[language] = scenario
+
+            self.assertEqual(
+                set(scenarios_by_language["en"]["scripts"]),
+                set(scenarios_by_language["zh"]["scripts"]),
+            )
+
+        qwen_recipe = yaml.safe_load(
+            (ROOT / "models/en/Qwen/Qwen3-30B-A3B.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        qwen_scenario = next(
+            scenario
+            for scenario in qwen_recipe["scenarios"]
+            if scenario["deployment"] == "non-pd"
+            and scenario["case"] == "2-node"
+        )
+        self.assertIn(
+            "--data-parallel-size 4",
+            qwen_scenario["scripts"]["api-0"]["content"],
+        )
+        self.assertIn(
+            "--headless",
+            qwen_scenario["scripts"]["headless-0"]["content"],
+        )
+
+        deepseek_recipe = yaml.safe_load(
+            (ROOT / "models/en/DeepSeek/DeepSeek-V2-Lite-W8A8.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        deepseek_scenario = next(
+            scenario
+            for scenario in deepseek_recipe["scenarios"]
+            if scenario["deployment"] == "pd" and scenario["case"] == "1p1d"
+        )
+        prefill = deepseek_scenario["scripts"]["prefill-0-template"]["content"]
+        decode = deepseek_scenario["scripts"]["decode-0-template"]["content"]
+        gateway = deepseek_scenario["scripts"]["gateway-0"]["content"]
+        service_check = deepseek_scenario["scripts"]["service-check"]["content"]
+        self.assertIn('"kv_port":"30000"', prefill)
+        self.assertIn('"kv_port":"30200"', decode)
+        self.assertNotIn('"engine_id"', prefill + decode)
+        self.assertIn("--served-model-name deepseek-v2-lite", prefill)
+        self.assertIn("--port 38085", gateway)
+        self.assertIn("--prefiller-ports 7100 7101", gateway)
+        self.assertIn("--decoder-ports 7100 7101", gateway)
+        self.assertIn("curl --fail --silent --show-error", service_check)
+        self.assertIn(":38085/v1/completions", service_check)
+        self.assertIn('["choices"]', service_check)
+
     def test_example_has_two_independent_two_instance_nodes(self) -> None:
         plan = load_plan(EXAMPLE / "plan.yaml")
 

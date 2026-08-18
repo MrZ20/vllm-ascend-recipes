@@ -62,9 +62,8 @@ jobs:
           MODEL_FILES="${{ steps.filter.outputs.models_files }}"
           echo "All changed model files: $MODEL_FILES"
           EN_RECIPES=$(echo "$MODEL_FILES" | tr ',' '\n' | grep '^models/en/.*\.\(yaml\|yml\)$' || true)
-          # Only trigger deployment verify for whitelisted models (see
-          # .github/recipe-verify-whitelist.txt — the single global whitelist
-          # shared with multinode-recipe-verify.yml).
+          # Only trigger deployment verify for models listed in the single-node
+          # whitelist at .github/recipe-verify-whitelist.txt.
           VERIFY_RECIPES=$(echo "$EN_RECIPES" | grep -E -f <(grep -vE '^\s*(#|$)' .github/recipe-verify-whitelist.txt) || true)
           if [ -n "$VERIFY_RECIPES" ]; then
             COUNT=$(echo "$VERIFY_RECIPES" | wc -l)
@@ -189,4 +188,3 @@ jobs:
       trigger_type: pr
       head_sha: ${{ github.event.pull_request.head.sha }}
       started_at_iso: ${{ github.event.pull_request.updated_at }}
-

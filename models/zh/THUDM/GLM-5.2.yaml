@@ -309,8 +309,6 @@ scenarios:
   precision: W4A8C8
   deployment: PD 分离
   case: 高吞吐
-  tags: [pd-multinode]
-  strategy: pd_cluster
   steps:
   - title: 场景概览
     content: |-
@@ -333,8 +331,6 @@ scenarios:
   precision: W4A8C8
   deployment: PD 分离
   case: 长上下文 1M
-  tags: [pd-multinode]
-  strategy: pd_cluster
   steps:
   - title: 场景概览
     content: |-

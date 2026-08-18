@@ -52,10 +52,6 @@ test/ut/multi_node_framework/        # 不依赖 NPU 的 Runtime 单元测试
 .github/workflows/_verify_multi_node.yaml
 ```
 
-仓库还存在 `scripts/multinode/` 和 `multinode-recipe-verify.yml`。它们属于已有的 Recipe
-解析/验证流水线，不是本文描述的新 Runtime。由于新 converter 尚未完成，这套已有能力当前仍被
-workflow 和前端代码使用，不能作为“无引用旧代码”删除。
-
 ## 3. 总体架构
 
 ### 3.1 一个 Pod/节点只有一个 Runner

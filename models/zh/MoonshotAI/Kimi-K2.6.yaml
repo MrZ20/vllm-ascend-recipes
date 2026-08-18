@@ -303,8 +303,6 @@ scenarios:
   precision: W4A8
   deployment: 单节点-多卡
   case: 高吞吐
-  tags: [a3-single]
-  strategy: single_node_A3
   steps:
   - title: 启动服务
     content: |-
@@ -393,8 +391,6 @@ scenarios:
   precision: W4A8
   deployment: 多节点-PD分离
   case: PD 分离
-  tags: [pd-multinode]
-  strategy: pd_cluster
   steps:
   - title: 概述
     content: |-

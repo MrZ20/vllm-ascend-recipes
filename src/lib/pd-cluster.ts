@@ -51,8 +51,7 @@ export function fillDottedIps(
   });
 }
 
-// Mirrors scripts/multinode/node_entry.py fill_kv_config: kv_port +100 per node,
-// engine_id +1 per node within the same role group.
+// Keep each node's KV port and engine ID distinct within the same role group.
 export function bumpKvConfig(text: string, nodeIdx: number): string {
   return text
     .replace(

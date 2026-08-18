@@ -101,6 +101,7 @@ compatible_strategies:
   - single_node_A3
   - single_node_A2
   - single_node_310p
+  - multi_node_dp
 
 hardware_overrides: {}
 strategy_overrides: {}
@@ -423,11 +424,112 @@ env_setup:
       For more details, please refer to the [Installation Guide](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 scenarios:
 - npu: Atlas 800I A3
+  precision: bf16
+  deployment: non-pd
+  case: 2-node
+  config_params:
+    max_model_len:
+      default: 4096
+      type: number
+      description: "Maximum context length for the two-node verification"
+    max_num_seqs:
+      default: 8
+      type: number
+      description: "Maximum concurrent sequences for the two-node verification"
+    gpu_memory_utilization:
+      default: 0.9
+      type: number
+      description: "KV-cache memory fraction for the two-node verification"
+  scripts:
+    api-0:
+      language: bash
+      content: |-
+        export OMP_PROC_BIND=false
+        export OMP_NUM_THREADS=10
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export HCCL_BUFFSIZE=1024
+        export VLLM_USE_MODELSCOPE=true
+        export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"
+
+        vllm serve "$MODEL_PATH" \
+            --host "$API_NODE_0_IP" \
+            --port 7100 \
+            --served-model-name qwen3 \
+            --data-parallel-size 4 \
+            --data-parallel-size-local 2 \
+            --data-parallel-address "$API_NODE_0_IP" \
+            --data-parallel-rpc-port 12321 \
+            --tensor-parallel-size 1 \
+            --max-model-len {{max_model_len}} \
+            --max-num-seqs {{max_num_seqs}} \
+            --max-num-batched-tokens 4096 \
+            --gpu-memory-utilization {{gpu_memory_utilization}} \
+            --trust-remote-code \
+            --enable-expert-parallel \
+            --no-enable-prefix-caching \
+            --enforce-eager
+    headless-0:
+      language: bash
+      content: |-
+        export OMP_PROC_BIND=false
+        export OMP_NUM_THREADS=10
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+        export HCCL_BUFFSIZE=1024
+        export VLLM_USE_MODELSCOPE=true
+        export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"
+
+        vllm serve "$MODEL_PATH" \
+            --headless \
+            --data-parallel-size 4 \
+            --data-parallel-size-local 2 \
+            --data-parallel-start-rank 2 \
+            --data-parallel-address "$API_NODE_0_IP" \
+            --data-parallel-rpc-port 12321 \
+            --tensor-parallel-size 1 \
+            --max-model-len {{max_model_len}} \
+            --max-num-seqs {{max_num_seqs}} \
+            --max-num-batched-tokens 4096 \
+            --gpu-memory-utilization {{gpu_memory_utilization}} \
+            --trust-remote-code \
+            --enable-expert-parallel \
+            --no-enable-prefix-caching \
+            --enforce-eager
+    service-check:
+      language: bash
+      content: |-
+        response=$(curl --fail --silent --show-error \
+          "http://${API_NODE_0_IP}:7100/v1/completions" \
+          -H 'Content-Type: application/json' \
+          -d '{"model":"qwen3","prompt":"The future of AI is","max_tokens":50,"temperature":0}')
+
+        python3 -c 'import json, sys; assert json.load(sys.stdin)["choices"]' <<<"$response"
+  steps:
+  - title: Overview
+    content: |-
+      This is a two-node non-PD internal-DP topology. The API node hosts DP ranks 0 and 1;
+      the Headless node hosts DP ranks 2 and 3. Each node uses two NPUs, giving global
+      DP=4 and TP=1. Port 7100 on the API node is the only service endpoint.
+
+      Set the model path and API-node address before running the scripts:
+
+      ```bash
+      export MODEL_PATH="${MODEL_PATH:-your_model_path}"
+      export API_NODE_0_IP="${API_NODE_0_IP:-<api_node_0_ip>}"
+      export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"
+      ```
+  - title: Start API node 0
+    content: |-
+      {{script:api-0}}
+  - title: Start Headless node 0
+    content: |-
+      {{script:headless-0}}
+  - title: Service verification
+    content: |-
+      {{script:service-check}}
+- npu: Atlas 800I A3
   precision: W8A8
   deployment: Single-Node
   case: Single Node Multi Card
-  tags: [a3-single]
-  strategy: single_node_A3
   steps:
   - title: Start the server
     content: |-
@@ -481,8 +583,6 @@ scenarios:
   precision: W8A8
   deployment: Single-Node
   case: Single Node Multi Card (A2)
-  tags: [a2-single]
-  strategy: single_node_A2
   steps:
   - title: Start the server
     content: |-
@@ -535,8 +635,6 @@ scenarios:
   precision: W8A8
   deployment: Single-Node
   case: 300I DUO (TP2)
-  tags: [310p-single]
-  strategy: single_node_310p
   steps:
   - title: Start the server
     content: |-

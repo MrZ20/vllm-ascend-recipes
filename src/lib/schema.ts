@@ -122,20 +122,83 @@ export const scenarioSelectorLabelsSchema = z.object({
   case: z.string().optional(),
 });
 
-export const scenarioSchema = z.object({
-  npu: z.string(),
-  precision: z.string(),
-  deployment: z.string(),
-  case: z.string(),
-  // Pipeline-routing labels: a2-single / a3-single / pd-multinode, …
-  tags: z.array(z.string()).optional(),
-  // Interlocks with top-level compatible_strategies (single_node_A2 /
-  // single_node_A3 / pd_cluster) and routes the CI pipeline.
-  strategy: z.string().optional(),
-  steps: z.array(scenarioStepSchema),
-  default_configs: z.array(z.string()).optional(),
-  config_params: z.record(z.string(), configParamSchema).optional(),
+export const scenarioScriptSchema = z.object({
+  language: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_+-]*$/),
+  content: z.string(),
 });
+
+export const scenarioSchema = z
+  .object({
+    npu: z.string(),
+    precision: z.string(),
+    deployment: z.string(),
+    case: z.string(),
+    scripts: z.record(z.string(), scenarioScriptSchema).optional(),
+    steps: z.array(scenarioStepSchema),
+    default_configs: z.array(z.string()).optional(),
+    config_params: z.record(z.string(), configParamSchema).optional(),
+  })
+  .superRefine((scenario, ctx) => {
+    // Scenarios using the structured script contract also use canonical,
+    // machine-readable topology fields. Legacy display-only scenarios remain
+    // valid until they are migrated to this contract.
+    if (scenario.scripts !== undefined) {
+      if (scenario.deployment !== 'pd' && scenario.deployment !== 'non-pd') {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['deployment'],
+          message: 'script-backed scenarios require deployment to be exactly pd or non-pd',
+        });
+      } else {
+        const validCase =
+          scenario.deployment === 'pd'
+            ? /^[1-9]\d*p[1-9]\d*d$/.test(scenario.case)
+            : /^[1-9]\d*-node$/.test(scenario.case);
+        if (!validCase) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['case'],
+            message:
+              scenario.deployment === 'pd'
+                ? 'pd cases must match <positive integer>p<positive integer>d'
+                : 'non-pd cases must match <positive integer>-node',
+          });
+        }
+      }
+    }
+
+    for (const [name, script] of Object.entries(scenario.scripts ?? {})) {
+      if (script.content.includes('{{script:')) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['scripts', name, 'content'],
+          message: 'scenario scripts cannot reference other scenario scripts',
+        });
+      }
+    }
+
+    scenario.steps.forEach((step, stepIndex) => {
+      const referencePattern = /\{\{script:([^{}]*)\}\}/g;
+      for (const match of step.content.matchAll(referencePattern)) {
+        const name = match[1];
+        if (name && !scenario.scripts?.[name]) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['steps', stepIndex, 'content'],
+            message: `unknown scenario script reference: ${name}`,
+          });
+        }
+      }
+      const withoutValidReferences = step.content.replace(/\{\{script:([^{}]+)\}\}/g, '');
+      if (withoutValidReferences.includes('{{script:')) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['steps', stepIndex, 'content'],
+          message: 'malformed scenario script reference',
+        });
+      }
+    });
+  });
 
 // ========== References ==========
 export const referenceSchema = z.object({
